@@ -447,3 +447,135 @@ TEST_CASE ("Engine: CPU cost with every voice on")
     REQUIRE (allFinite (out.l));
     REQUIRE (pct < 15.0);
 }
+
+// ---------------------------------------------------------------------------
+// Static report (Serato, Nov 2026, the whole LowKei family). These fail on
+// Lodestone 1.0.0 and pass from 1.0.1.
+
+namespace
+{
+// Sharpest moment (largest second difference, either channel) in [from, to).
+float sharpness (const StereoOut& o, size_t from, size_t to)
+{
+    float m = 0.0f;
+    for (size_t i = std::max<size_t> (from, 2); i < std::min (to, o.l.size()); ++i)
+        m = std::max ({ m, std::abs (o.l[i] - 2 * o.l[i - 1] + o.l[i - 2]), std::abs (o.r[i] - 2 * o.r[i - 1] + o.r[i - 2]) });
+    return m;
+}
+
+// Runs a held note, applies `change` at 0.5 s, and returns how much sharper the
+// change is than the voice's own sharpest moment before and after it.
+float clickRatio (EngineParams p, const std::function<void (EngineParams&)>& change)
+{
+    VoiceEngine e;
+    e.prepare (kFs);
+    e.setParams (p);
+    const auto in = steady (64.3, 1.2);
+    StereoOut o;
+    o.l.resize (in.size()); o.r.resize (in.size()); o.dry.resize (in.size());
+    const size_t at = (size_t) (0.5 * kFs) / VoiceEngine::kBlock * VoiceEngine::kBlock;
+    for (size_t pos = 0; pos < in.size(); pos += VoiceEngine::kBlock)
+    {
+        if (pos == at) { change (p); e.setParams (p); }
+        e.process (&in[pos], &o.l[pos], &o.r[pos], &o.dry[pos], VoiceEngine::kBlock);
+    }
+    const size_t win = 4096;
+    const float ref = std::max (sharpness (o, at - (size_t) (0.3 * kFs), at - 512), sharpness (o, at + win, at + (size_t) (0.6 * kFs))) + 1.0e-6f;
+    return sharpness (o, at - 16, at + win) / ref;
+}
+} // namespace
+
+TEST_CASE ("Static: Lead, Breath, Grit and Throat steps glide instead of clicking")
+{
+    EngineParams p;
+    CHECK (clickRatio (p, [] (EngineParams& q) { q.leadLevel = 0.0f; }) < 1.25f);
+    p.leadLevel = 0.0f;
+    CHECK (clickRatio (p, [] (EngineParams& q) { q.leadLevel = 1.0f; }) < 1.25f);
+    p = {};
+    CHECK (clickRatio (p, [] (EngineParams& q) { q.grit = 1.0f; }) < 1.25f);
+    CHECK (clickRatio (p, [] (EngineParams& q) { q.formant = -12.0f; }) < 1.25f);
+    p.tuner.transpose = -12.0f;
+    CHECK (clickRatio (p, [] (EngineParams& q) { q.formantPreserve = false; }) < 1.25f);   // Character to Classic
+    p = {};
+    p.harmony[0].on = true;
+    CHECK (clickRatio (p, [] (EngineParams& q) { q.harmony[0].formant = 12.0f; }) < 1.25f);
+}
+
+TEST_CASE ("Static: a synced LFO eases across a playhead jump instead of snapping")
+{
+    LfoParams lp;
+    lp.shape = LfoShape::triangle;
+    lp.sync = true;
+    lp.division = Div::bars2;
+    Transport t;
+    t.sampleRate = kFs;
+    t.bpm = 120.0;
+    t.playing = true;
+
+    auto runTo = [&] (ModLfo& lfo, double beats)
+    {
+        float v = 0.0f;
+        while (t.ppq < beats) { v = lfo.advance (lp, t, 32, 1); t.ppq += t.beatsPerSample() * 32; }
+        return v;
+    };
+
+    ModLfo lfo;
+    t.ppq = 0.0;
+    const float before = runTo (lfo, 4.0);   // one bar in: the 2-bar triangle is at its top
+    REQUIRE (before > 0.95f);
+
+    // A 1-bar loop wraps back to beat 0, where the triangle is at its bottom.
+    t.ppq = 0.0;
+    lfo.easeNextJump();
+    const float first = lfo.advance (lp, t, 32, 1);
+    CHECK (std::abs (first - before) < 0.1f);              // no jump: it starts where it was
+    t.ppq += t.beatsPerSample() * 32;
+    float v = first;
+    for (int b = 0; b < (int) (0.1 * kFs / 32); ++b) { v = lfo.advance (lp, t, 32, 1); t.ppq += t.beatsPerSample() * 32; }
+    ModLfo plain;
+    const float raw = plain.advance (lp, t, 32, 1);
+    CHECK (std::abs (v - raw) < 0.01f);                     // and is back on the grid within 100 ms
+
+    // Without a jump nothing changes: playback still equals a bounce.
+    ModLfo a, b;
+    t.ppq = 1.0;
+    for (int k = 0; k < 100; ++k) { REQUIRE (a.advance (lp, t, 32, 1) == b.advance (lp, t, 32, 1)); t.ppq += t.beatsPerSample() * 32; }
+}
+
+TEST_CASE ("Static: a sound change fades to dry, holds, then fades back smoothly")
+{
+    OutputStage out;
+    out.prepare (kFs);
+    OutputParams op;
+    out.setParams (op);
+    constexpr int n = 32;
+    float dry[n], wl[n], wr[n];
+    auto block = [&] (float d, float w)
+    {
+        std::fill (dry, dry + n, d);
+        std::fill (wl, wl + n, w);
+        std::fill (wr, wr + n, w);
+        out.process (dry, dry, wl, wr, n);
+    };
+
+    block (0.1f, 0.5f);
+    REQUIRE_THAT (wl[n - 1], WithinAbs (0.5f, 1e-4));
+    out.setTransition (true);
+    float last = wl[n - 1], maxStep = 0.0f;
+    int samples = 0;
+    while (! out.readyForSwap() && samples < (int) kFs)
+    {
+        block (0.1f, 0.5f);
+        for (int i = 0; i < n; ++i) { maxStep = std::max (maxStep, std::abs (wl[i] - last)); last = wl[i]; }
+        samples += n;
+    }
+    CHECK_THAT (wl[n - 1], WithinAbs (0.1f, 1e-4));                     // fully dry
+    CHECK (samples <= (int) (0.032 * kFs));                              // 20 ms fade + 10 ms hold
+    CHECK (samples >= (int) (0.029 * kFs));
+    CHECK (maxStep < 0.4f * 2.0f / (0.02f * (float) kFs) * 1.6f);       // an S-curve, no step
+
+    out.setTransition (false);
+    for (int k = 0; k < (int) (0.025 * kFs) / n; ++k) block (0.1f, 0.5f);
+    CHECK_THAT (wl[n - 1], WithinAbs (0.5f, 1e-4));                      // the new sound fully in
+    CHECK (out.getTransition() == 0.0f);
+}

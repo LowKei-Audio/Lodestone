@@ -1,14 +1,19 @@
 # Builds Lodestone for Windows, verifies it, and publishes the plugin as a
 # downloadable artifact. A run only goes green if every check passes:
-#   1. DSP unit tests (engines, chain, stability, clicks, CPU)
-#   2. Patch/state checks (save/restore, ENTRY, IMPACT, Debris Freeze, undo, randomizer)
-#   3. Every factory preset rendered as saved, with ENTRY, with IMPACT and with macros maxed
-#   4. pluginval at strictness 10 (host-compatibility torture test)
-#   5. Steinberg's official VST3 validator
-#   6. clap-validator, the official CLAP conformance suite
+#   1. DSP unit tests (detection, tuning, formants, harmonies, MIDI modes, safety,
+#      click-free glides and sound-change fades, CPU)
+#   2. Patch/state checks (save/restore, latency modes, tuning end to end, LEARN,
+#      undo, preset data, randomizer)
+#   3. Every factory preset rendered as saved, with SNAP, with HOLD and with macros maxed
+#   4. Static and clicks: preset changes, Dice, A/B, undo and host loads while
+#      singing; loop wraps and transport restarts with synced LFOs; held notes;
+#      every knob jumped and every switch flipped
+#   5. pluginval at strictness 10 (host-compatibility torture test)
+#   6. Steinberg's official VST3 validator
+#   7. clap-validator, the official CLAP conformance suite
 # Each check also posts its headline result as an annotation on the run page.
 # After the checks, it builds the Inno Setup installer. Publishing a release:
-#   - push a version tag (v1.0.0), or
+#   - push a version tag (v1.0.1), or
 #   - push to the `release` branch: the run creates the v<version> tag from
 #     CMakeLists.txt itself and publishes the GitHub Release (it refuses a
 #     version that has already been released).
@@ -89,6 +94,11 @@ jobs:
         run: |
           ./build/lodestone_check_artefacts/Release/lodestone_check.exe presets | tee presets.log
           echo "::notice title=Factory presets::$(grep 'preset(s) failed' presets.log)"
+
+      - name: Static and click check
+        run: |
+          ./build/lodestone_check_artefacts/Release/lodestone_check.exe static | tee static.log
+          echo "::notice title=Static and clicks::$(grep 'worst event' static.log) | $(tail -1 static.log)"
 
       - name: UI snapshots (Windows font rendering)
         run: |

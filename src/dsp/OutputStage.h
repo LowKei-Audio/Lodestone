@@ -4,6 +4,11 @@
 //   wet -> Bass Mono -> Width (M/S)
 //   out = dry + Mix * (wet - dry)       (or Delta: only what Lodestone adds)
 //   -> Output gain -> Safety limiter (instant attack, -0.3 dBFS ceiling)
+//
+// Sound changes (presets, Dice, A/B, host loads): setTransition (true) fades
+// the wet part out to the aligned dry voice (S-curve, kFadeMs); once it has
+// been fully dry for kHoldMs, readyForSwap() says the new settings may be
+// taken; setTransition (false) fades the new sound back in.
 
 #include "Module.h"
 
@@ -24,6 +29,7 @@ class OutputStage
 {
 public:
     static constexpr float kCeiling = 0.9661f;   // -0.3 dBFS
+    static constexpr float kFadeMs = 20.0f, kHoldMs = 10.0f;
 
     void prepare (double sampleRate)
     {
@@ -32,7 +38,12 @@ public:
         for (auto* s : { &widthS, &mixS, &gainS, &deltaS })
             s->prepare (sampleRate, 25.0f);
         release = std::exp (-1.0f / (0.12f * fs));
+        fadeStep = 1.0f / (0.001f * kFadeMs * fs);
+        holdSamples = (int) (0.001f * kHoldMs * fs);
         primed = false;
+        transition = 0.0f;
+        toDry = false;
+        held = 0;
         reset();
     }
 
@@ -57,6 +68,13 @@ public:
             primed = true;
         }
     }
+
+    void setTransition (bool dry) noexcept { toDry = dry; if (dry) held = 0; }
+    float getTransition() const noexcept { return transition; }   // 0 = normal, 1 = fully dry
+    bool readyForSwap() const noexcept   { return transition >= 1.0f && held >= holdSamples; }
+    // At the swap (fully dry, so unheard): the wet-side smoothers jump to the new settings.
+    // Output gain keeps gliding: it also scales the dry voice that is playing.
+    void snapWet() noexcept { for (auto* s : { &widthS, &mixS, &deltaS }) s->snapTo (s->getTarget()); }
 
     // Peak gain reduction of the last block (1 = none), for the UI meter.
     float gainReduction() const noexcept { return gr; }
@@ -83,7 +101,12 @@ public:
             l = mid + side;
             r = mid - side;
 
-            const float mix = mixS.next(), d = deltaS.next(), g = gainS.next();
+            // Sound-change fade: the wet part's share follows an S-curve.
+            if (toDry) { if (transition < 1.0f) transition = std::min (1.0f, transition + fadeStep); else ++held; }
+            else if (transition > 0.0f) transition = std::max (0.0f, transition - fadeStep);
+            const float keep = transition > 0.0f ? 0.5f + 0.5f * std::cos (kPi * transition) : 1.0f;
+
+            const float mix = mixS.next() * keep, d = deltaS.next(), g = gainS.next();
             const float outL = dryL[i] + mix * (l - dryL[i]);
             const float outR = dryR[i] + mix * (r - dryR[i]);
             const float deltaL = mix * (l - dryL[i]);
@@ -108,6 +131,9 @@ public:
 
 private:
     float fs = 48000.0f, release = 0.999f, env = 0.0f, gr = 1.0f;
+    float transition = 0.0f, fadeStep = 0.001f;
+    int held = 0, holdSamples = 480;
+    bool toDry = false;
     OutputParams params;
     LinkwitzRiley bassSplit[2];
     Smoother widthS, mixS, gainS, deltaS;

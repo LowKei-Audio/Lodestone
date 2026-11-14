@@ -9,7 +9,13 @@ Lodestone is real-time pitch correction, harmony and doubling from LowKei Audio.
 - Hosts: Serato Studio, FL Studio and Ableton Live load the VST3. FL Studio, Bitwig Studio and Reaper also load the CLAP.
 - Views: Easy (key, the live field, SNAP and HOLD, the main tuning knobs and the macros) and Pro (every control, harmonies, modulation and global settings).
 - Presets: 47 factory presets in 12 categories, each with its four macros assigned.
-- Version: 1.0.0
+- Version: 1.0.1
+
+CHANGES
+-------
+
+  1.0.1:  Static and clicks fixed (reported in Serato Studio for the whole LowKei Audio family). Preset changes (the preset menu, Dice, A/B, undo and redo of a preset load, and the host loading a project) are now seamless: Lodestone dips to your dry voice for about 50 ms, swaps every setting at once and fades the new sound in. Before, settings changed one by one under the voice, and some switches clicked. Loops and restarts: tempo-synced LFOs ease onto the new beat position when a loop wraps round or the transport restarts over sound, instead of snapping. Starting from silence is still exact, so playback matches a bounce. Knobs and automation: Lead, Breath and Grit used to jump in a single sample when moved quickly or automated in steps, which clicked (Lead was the worst). They now glide over about 12 ms. Throat, the harmonies' Formant and Character glide over about 20 ms, so they no longer click when they change quickly (by hand, by a macro or by a synced LFO on a loop). New regression checks cover all of this. Saved projects load as before, and 46 of the 47 factory presets render bit for bit the same as in 1.0.0; Throat Sweep differs only by the new 20 ms smoothing of its LFO-driven Throat.
+  1.0.0:  First release.
 
 
 
@@ -31,7 +37,7 @@ WHAT IT DOES THAT OTHERS DON'T
 INSTALL (WINDOWS)
 -----------------
 
-1. Download Lodestone-1.0.0-Windows-Setup.exe from the repository's Releases page.
+1. Download Lodestone-1.0.1-Windows-Setup.exe from the repository's Releases page.
 2. Run it and choose VST3 and CLAP plug-ins and standalone app or Plug-ins only. The installer places the VST3 in C:\Program Files\Common Files\VST3 and the CLAP in C:\Program Files\Common Files\CLAP, the standard folders every supported DAW scans, and adds Start menu shortcuts for the app and this guide.
 3. Rescan in your DAW:
 
@@ -221,7 +227,7 @@ The plugins are written to build/src/Lodestone_artefacts/Release/VST3/ and .../R
 
 To build the installer locally, install [Inno Setup 6](https://jrsoftware.org/isinfo.php), then from the repository root:
 
-    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=1.0.0 /DBuildDir=..\build installer\Lodestone.iss
+    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=1.0.1 /DBuildDir=..\build installer\Lodestone.iss
 
 The installer is written to installer\Output\. To publish a release, either push a tag such as v1.0.0 (it must match the version in CMakeLists.txt), or push the commit to the release branch: CI builds and verifies it, then creates the v<version> tag and the GitHub Release itself (it refuses a version that is already released).
 
@@ -233,6 +239,7 @@ The Build workflow runs on pushes to dev and release, on version tags and on dem
 1. DSP tests (lodestone_tests): pitch detection within 2 cents from 82 Hz to 1.3 kHz with no octave errors, off-key notes land within 3 cents in both latency modes, in-tune audio passes through unchanged, transposed voices keep their formants (Modern) or move them (Classic), Throat moves the formants by the amount asked, scale-aware harmonies and MIDI modes land on the right notes, glides step through the scale, Stability ignores wide vibrato, Bounce overshoots and settles, and everything stays bounded on silence, noise, clipping input and every sample rate, at a few percent of one CPU core.
 2. State checks (lodestone_check state): save and restore, byte-identical reloads, latency modes, end-to-end tuning through the plugin, LEARN on a real melody, custom notes, macros, undo, preset data and 25 random settings.
 3. Factory presets (lodestone_check presets): every preset on a sung melody, as saved, with SNAP, with HOLD and with all four macros at full: no NaN, no clipping, no runaway level, no silence.
-4. pluginval at strictness 10, Steinberg's VST3 validator and clap-validator.
+4. Static and clicks (lodestone_check static), on a held, sung note through the plugin: every factory preset, Dice, A/B, undo, redo and a host project load while singing (at 512- and 96-sample buffers, each fully settled within 64 ms), loop wraps with tempo-synced LFOs (512- and 1000-sample buffers), transport restarts over sound, every preset on a held note, and every knob jumped end to end and every switch flipped. No event may be more than 1.25 times as sharp as the voice itself (the same bar as Starfire and Possession).
+5. pluginval at strictness 10, Steinberg's VST3 validator and clap-validator.
 
 tools/make_docs.py regenerates README.txt and docs/README.pdf from this file.

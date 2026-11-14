@@ -17,8 +17,8 @@ LodestoneEditor::Content::Content (LodestoneProcessor& p)
 
     easyTab.onClick = [this] { setView (false); };
     proTab.onClick = [this] { setView (true); };
-    undoBtn.onClick = [this] { proc.undo.undo(); };
-    redoBtn.onClick = [this] { proc.undo.redo(); };
+    undoBtn.onClick = [this] { proc.undoEdit(); };
+    redoBtn.onClick = [this] { proc.redoEdit(); };
     easyTab.setTooltip ("Easy view: key, the field, SNAP, HOLD, the main tuning knobs and the macros. Every preset is playable here.");
     proTab.setTooltip ("Pro view: every control, harmonies, the modulation matrix and global settings");
     undoBtn.setTooltip ("Undo");

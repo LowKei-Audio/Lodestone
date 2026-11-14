@@ -6,6 +6,9 @@
 //   ModLfo     - 7 shapes incl. sample & hold and smooth random; free (Hz)
 //                or locked to the host grid. Random shapes are seeded per
 //                cycle, so a synced pattern repeats identically on every pass.
+//                A synced LFO follows the host's playhead, so when it jumps
+//                (a loop wrapping round, a restart over sound) the value
+//                eases onto the new position (~15 ms) instead of snapping.
 //   EnvFollower- input loudness -> 0..1
 //   Chaos      - random drift: stepped (S&H) through to smooth gliding
 
@@ -32,11 +35,16 @@ class ModLfo
 {
 public:
     void setIndex (int i) noexcept { index = (std::uint32_t) i; }
-    void reset() noexcept { freePhase = 0.0; value = 0.0f; }
+    void reset() noexcept { freePhase = 0.0; value = 0.0f; offset = 0.0f; ease = false; }
+
+    // The playhead jumped: ease from the current value to wherever the next
+    // advance() lands (only matters for synced LFOs).
+    void easeNextJump() noexcept { ease = true; }
 
     // Advance by `samples` and return the value (-1..1) for this block.
     float advance (const LfoParams& p, const Transport& t, int samples, std::uint32_t seed) noexcept
     {
+        const float previous = value;
         double pos;   // position in cycles
         if (p.sync)
         {
@@ -51,24 +59,35 @@ public:
         const auto cycle = (std::int64_t) std::floor (pos);
         const float ph = (float) (pos - std::floor (pos));
 
+        float v = 0.0f;
         switch (p.shape)
         {
-            case LfoShape::sine:     value = std::sin (kTwoPi * ph); break;
-            case LfoShape::triangle: value = 1.0f - 4.0f * std::abs (ph - 0.5f); break;
-            case LfoShape::sawUp:    value = 2.0f * ph - 1.0f; break;
-            case LfoShape::sawDown:  value = 1.0f - 2.0f * ph; break;
-            case LfoShape::square:   value = ph < 0.5f ? 1.0f : -1.0f; break;
+            case LfoShape::sine:     v = std::sin (kTwoPi * ph); break;
+            case LfoShape::triangle: v = 1.0f - 4.0f * std::abs (ph - 0.5f); break;
+            case LfoShape::sawUp:    v = 2.0f * ph - 1.0f; break;
+            case LfoShape::sawDown:  v = 1.0f - 2.0f * ph; break;
+            case LfoShape::square:   v = ph < 0.5f ? 1.0f : -1.0f; break;
             case LfoShape::sampleHold:
-                value = 2.0f * hash01 (seed + index * 7919u, (std::uint32_t) cycle) - 1.0f;
+                v = 2.0f * hash01 (seed + index * 7919u, (std::uint32_t) cycle) - 1.0f;
                 break;
             case LfoShape::smoothRandom:
             {
                 const float a = 2.0f * hash01 (seed + index * 7919u, (std::uint32_t) cycle) - 1.0f;
                 const float b = 2.0f * hash01 (seed + index * 7919u, (std::uint32_t) (cycle + 1)) - 1.0f;
                 const float s = 0.5f - 0.5f * std::cos (kPi * ph);
-                value = a + s * (b - a);
+                v = a + s * (b - a);
                 break;
             }
+        }
+
+        // Jump easing: start from the value it had, let the difference decay (block rate).
+        if (ease && p.sync) offset = previous - v;
+        ease = false;
+        value = v + offset;
+        if (offset != 0.0f)
+        {
+            offset *= std::exp (-(float) samples / (0.015f * (float) t.sampleRate));
+            if (std::abs (offset) < 1.0e-5f) offset = 0.0f;
         }
         return value;
     }
@@ -78,7 +97,8 @@ public:
 private:
     std::uint32_t index = 0;
     double freePhase = 0.0;
-    float value = 0.0f;
+    float value = 0.0f, offset = 0.0f;
+    bool ease = false;
 };
 
 struct EnvParams

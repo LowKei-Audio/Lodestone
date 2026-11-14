@@ -107,6 +107,7 @@ public:
         levelSmooth = 1.0f - std::exp (-1.0f / (0.02f * (float) fs));
         energyCoeff = std::exp (-1.0f / (0.0008f * (float) fs));
         bypassSmooth = 1.0f - std::exp (-1.0f / (0.015f * (float) fs));
+        paramSmooth = 1.0f - std::exp (-1.0f / (0.012f * (float) fs));
         setLowLatency (lowLatency);
         reset();
     }
@@ -141,7 +142,19 @@ public:
         for (auto& g : harmonyGate) g = 0.0f;
         for (auto& d : drift) d = {};
         view = {};
+        leadLevelS = params.leadLevel;
+        breathS = params.breath;
+        gritS = params.grit;
+        classicS = leadThroatS = 0.0f;
+        harmThroatS.fill (0.0f);
+        formantPrimed = false;
+        snapPending = false;
     }
+
+    // After a sound change (the output is fully dry at this point, so nothing
+    // here is heard): the next block jumps every glide and level straight to
+    // the new settings, so the new sound fades in already complete.
+    void snapToTargets() noexcept { snapPending = true; }
 
     // Live (low latency) or Studio (lined up): sets the audio delay.
     void setLowLatency (bool live) noexcept
@@ -204,13 +217,19 @@ public:
             float l = accL[k], r = accR[k];
             accLead[k] = accL[k] = accR[k] = 0.0f;
 
+            // Level-type settings glide per sample (~12 ms): a step in any of
+            // them (a knob jump, automation, a macro) is otherwise a click.
+            leadLevelS += (params.leadLevel - leadLevelS) * paramSmooth;
+            breathS += (params.breath - breathS) * paramSmooth;
+            gritS += (params.grit - gritS) * paramSmooth;
+
             // Grit: ring modulation locked to the output pitch.
-            if (params.grit > 0.001f)
+            if (gritS > 1.0e-4f)
             {
                 const float f0 = (float) fs / std::max (8.0f, lastOutPeriod);
                 gritPhase += f0 * kGritModes[std::clamp (params.gritMode, 0, kNumGritModes - 1)].ratio / (float) fs;
                 gritPhase -= std::floor (gritPhase);
-                const float g = clamp01 (params.grit) * voicedEnv;
+                const float g = clamp01 (gritS) * voicedEnv;
                 // Power-neutral: the ring-modulated part is louder by the loss it causes.
                 const float norm = 1.0f / std::sqrt ((1.0f - g) * (1.0f - g) + 1.28f * g * g);
                 lead *= norm * (1.0f - g + g * 1.6f * std::sin (kTwoPi * gritPhase));
@@ -219,7 +238,7 @@ public:
             // Nothing to change on the lead: crossfade to the clean, delayed voice.
             bypass += ((bypassWanted ? 1.0f : 0.0f) - bypass) * bypassSmooth;
             const float tuned = lead + bypass * (dry - lead);
-            const float leadOut = params.leadLevel * (voicedEnv * tuned + (1.0f - voicedEnv) * params.breath * dry);
+            const float leadOut = leadLevelS * (voicedEnv * tuned + (1.0f - voicedEnv) * breathS * dry);
             outL[i] = (leadOut + l) * ceilingGain;
             outR[i] = (leadOut + r) * ceilingGain;
             dryOut[i] = dry;
@@ -374,18 +393,38 @@ private:
             shiftHist[(size_t) (b & (kShiftHist - 1))] = ts.shift;
         lastShiftBucket = bucket;
 
-        const float formantLead = std::pow (2.0f, params.formant / 12.0f);
         const float leadRatio = std::pow (2.0f, ts.shift / 12.0f);
+
+        // The formant settings (Throat, the harmonies' formant, Character) glide
+        // (~20 ms): a jump in the grain read rate between two grains clicks.
+        // The pitch-following part of Classic character stays instant.
+        const float formantGlide = 1.0f - std::exp (-dt / 0.02f);
+        auto glideTo = [&] (float& state, float target)
+        {
+            state = formantPrimed && ! snapPending ? state + formantGlide * (target - state) : target;
+            if (std::abs (target - state) < 1.0e-5f) state = target;
+            return state;
+        };
+        const float classicAmt = glideTo (classicS, params.formantPreserve ? 0.0f : 1.0f);
+        // Formant factor: settled glides use the exact 1.0.0 expressions, so a
+        // steady setting renders bit for bit as before.
+        auto formantFactor = [&] (float ratio, float& throatS, float throatSemis)
+        {
+            const float throat = glideTo (throatS, throatSemis / 12.0f);
+            const float c = classicAmt >= 1.0f ? ratio : classicAmt <= 0.0f ? 1.0f : std::exp2 (classicAmt * std::log2 (ratio));
+            return c * (throat == throatSemis / 12.0f ? std::pow (2.0f, throatSemis / 12.0f) : std::exp2 (throat));
+        };
 
         auto& lead = voices[leadVoice];
         lead.lead = true;
         lead.active = true;
         lead.shift = ts.shift;
-        lead.formant = (params.formantPreserve ? 1.0f : leadRatio) * formantLead;
+        lead.formant = formantFactor (leadRatio, leadThroatS, params.formant);
         lead.targetLevel = 1.0f;
         lead.delay = 0.0f;
         lastOutPeriod = (tr.voiced ? tr.period : lastVoicedPeriod) / std::max (0.1f, leadRatio);
-        bypassWanted = std::abs (ts.shift) < 0.005f && std::abs (params.formant) < 0.01f && params.grit < 0.001f;
+        bypassWanted = std::abs (ts.shift) < 0.005f && std::abs (params.formant) < 0.01f && std::abs (leadThroatS) < 1.0e-3f
+                    && params.grit < 0.001f && gritS < 1.0e-4f;
 
         // Harmonies: scale-step (or fixed) intervals from the target note, or
         // held MIDI notes in Harmony mode.
@@ -407,7 +446,8 @@ private:
 
             const float wantGate = on && ts.voiced ? 1.0f : 0.0f;
             harmonyGate[(size_t) h] += (wantGate - harmonyGate[(size_t) h]) * (1.0f - std::exp (-dt / 0.02f));
-            if (std::abs (interval - harmonyInterval[(size_t) h]) > 6.0f && harmonyGate[(size_t) h] < 0.05f)
+            if (snapPending) harmonyGate[(size_t) h] = wantGate;
+            if (snapPending || (std::abs (interval - harmonyInterval[(size_t) h]) > 6.0f && harmonyGate[(size_t) h] < 0.05f))
                 harmonyInterval[(size_t) h] = interval;   // first entry: no long glide
             else
                 harmonyInterval[(size_t) h] += glide * (interval - harmonyInterval[(size_t) h]);
@@ -416,7 +456,7 @@ private:
             v.active = on || harmonyGate[(size_t) h] > 0.001f;
             v.shift = harmonyInterval[(size_t) h] + 0.12f * d;   // + lead shift at its own time
             const float ratio = std::pow (2.0f, (ts.shift + v.shift) / 12.0f);
-            v.formant = (params.formantPreserve ? 1.0f : ratio) * std::pow (2.0f, hp.formant / 12.0f);
+            v.formant = formantFactor (ratio, harmThroatS[(size_t) h], hp.formant);
             v.targetLevel = hp.level * harmonyGate[(size_t) h];
             setPan (v, hp.pan);
             v.delay = (float) fs * 0.001f * (4.0f + 14.0f * params.harmonyHumanize * (0.5f + 0.5f * d));
@@ -437,6 +477,17 @@ private:
             v.formant = 1.0f;
             v.targetLevel = params.doubleOn ? params.doubleLevel : 0.0f;
             setPan (v, sign * params.doubleSpread);
+        }
+
+        formantPrimed = true;
+        if (snapPending)
+        {
+            snapPending = false;
+            for (auto& v : voices) v.level = v.targetLevel;
+            leadLevelS = params.leadLevel;
+            breathS = params.breath;
+            gritS = params.grit;
+            bypass = bypassWanted ? 1.0f : 0.0f;
         }
 
         // View for the UI.
@@ -571,6 +622,10 @@ private:
     float voicedEnv = 0.0f, gritPhase = 0.0f, energy = 0.0f, energyCoeff = 0.98f;
     bool lastMarkVoiced = false, bypassWanted = false;
     float bypass = 0.0f, bypassSmooth = 0.002f;
+    float leadLevelS = 1.0f, breathS = 1.0f, gritS = 0.0f, paramSmooth = 0.002f;   // per-sample glides
+    float classicS = 0.0f, leadThroatS = 0.0f;              // Character blend, lead Throat (octaves): glided
+    std::array<float, kNumHarmonies> harmThroatS {};        // harmony formants (octaves): glided
+    bool formantPrimed = false, snapPending = false;
     float envAttack = 0.02f, envRelease = 0.006f, levelSmooth = 0.002f;
     std::array<float, 12> chroma {};
     EngineView view;

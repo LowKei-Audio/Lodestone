@@ -13,6 +13,7 @@
 #include "dsp/OutputStage.h"
 #include "dsp/VoiceEngine.h"
 #include "presets/PresetManager.h"
+#include "state/SoundChangeGate.h"
 #include "state/StateGuard.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
@@ -77,6 +78,15 @@ public:
     juce::ValueTree getPatchState() const;
     void applyPatchState (const juce::ValueTree& tree, bool notifyHost);
 
+    // Click-free sound changes: every preset load, Dice, A/B, host load and the
+    // undo/redo of one of those opens a scope; the audio thread fades to the dry
+    // voice, swaps every setting at once and fades back in (~50 ms).
+    lowkei::SoundChangeGate soundGate;   // before presets: they use it from the start
+
+    // Undo / redo for the editor: a preset load or A/B step goes through the gate.
+    void undoEdit();
+    void redoEdit();
+
     PresetManager presets { *this };
 
     // Latency: Live (~3 ms) for tracking and performing, Studio (~15 ms, lined
@@ -131,6 +141,7 @@ public:
     // For tests / tools: the effective value of a parameter after modulation.
     float effectiveValue (P p) const noexcept { return eff[(size_t) idx (p)]; }
     const dsp::VoiceEngine& getEngine() const noexcept { return engine; }
+    float getSoundTransition() const noexcept { return output.getTransition(); }   // 0 = settled
 
 private:
     void valueTreePropertyChanged (juce::ValueTree& t, const juce::Identifier& prop) override
@@ -150,6 +161,7 @@ private:
     void setParamReal (int i, float real);
 
     void runControl (int len, float inPeak, const dsp::Transport& t);
+    bool updateSoundChange();
     void pushEngineParams();
     void handleMidi (const juce::MidiBuffer& midi);
 
@@ -177,6 +189,13 @@ private:
 
     double sampleRateHz = 48000.0;
     double freePpq = 0.0;
+
+    // Audio thread: transport jump detection and the sound-change gate.
+    bool wasPlaying = false;
+    double expectedPpq = 0.0;
+    float lastBlockPeak = 0.0f;
+    bool holdingSound = false;     // fading to dry / dry: the engine keeps the old settings
+    std::uint32_t seenSoundChange = 0;
 
     JUCE_DECLARE_WEAK_REFERENCEABLE (LodestoneProcessor)
 };

@@ -9,6 +9,12 @@
 //   lodestone_check state     save/restore round trip, latency modes, undo,
 //                             end-to-end tuning, key learning, preset data
 //                             integrity, randomizer safety
+//   lodestone_check static    clicks: every sound change while singing (presets,
+//                             Dice, A/B, undo, host loads), loop wraps with
+//                             synced LFOs, transport restarts over sound,
+//                             every factory preset on a held note, every knob
+//                             jumped and every switch flipped on Init
+//   lodestone_check edits [full]  diagnostic: the click ratio of every edit
 //
 // Exits non-zero on any failure: CI treats that as a failed build.
 
@@ -377,6 +383,336 @@ int checkState()
     return failures == 0 ? 0 : 1;
 }
 
+
+// ---------------------------------------------------------------------------
+// Static report (Serato, Nov 2026, the whole LowKei family): clicks on loop
+// restarts, transport restarts and preset changes. Every scenario plays a
+// held, sung vowel (no note changes, so the voice itself has no sharp edges)
+// through the real processor and measures each event's sharpest moment (the
+// second difference of the output) against the sharpest moment the sound
+// makes on its own around it. A click is far sharper than the voice.
+
+// A settable host transport: tempo, position and play state per block.
+struct TestPlayHead : juce::AudioPlayHead
+{
+    double bpm = 120.0, ppq = 0.0;
+    bool playing = false;
+    juce::Optional<PositionInfo> getPosition() const override
+    {
+        PositionInfo i;
+        i.setBpm (bpm);
+        i.setPpqPosition (ppq);
+        i.setIsPlaying (playing);
+        i.setTimeSignature (juce::AudioPlayHead::TimeSignature { 4, 4 });
+        return i;
+    }
+};
+
+struct StaticSession
+{
+    const int block;
+    LodestoneProcessor proc;
+    TestPlayHead head;
+    std::vector<float> l, r;
+    double phase = 0.0, t = 0.0;
+    double loopBeats = 0.0;     // > 0: the transport wraps back to 0 every loopBeats
+    std::vector<int> wraps;     // sample positions where it wrapped
+
+    explicit StaticSession (int blockSize = 512) : block (blockSize)
+    {
+        proc.setPlayHead (&head);
+        proc.setPlayConfigDetails (2, 2, kFs, block);
+        proc.prepareToPlay (kFs, block);
+    }
+
+    // A held "ah" a little sharp of E4, with gentle vibrato.
+    float nextVoice()
+    {
+        const double m = 64.3 + 0.2 * std::sin (2.0 * juce::MathConstants<double>::pi * 5.3 * t);
+        const double f0 = 440.0 * std::pow (2.0, (m - 69.0) / 12.0);
+        phase += f0 / kFs;
+        phase -= std::floor (phase);
+        t += 1.0 / kFs;
+        double s = 0.0;
+        for (int h = 1; h * f0 < 5000.0; ++h)
+        {
+            const double f = h * f0;
+            const double env = 0.1 + std::exp (-0.5 * std::pow ((f - 750.0) / 140.0, 2.0)) + 0.6 * std::exp (-0.5 * std::pow ((f - 1150.0) / 150.0, 2.0));
+            s += env / h * std::sin (2.0 * juce::MathConstants<double>::pi * h * phase);
+        }
+        return (float) (0.22 * s * std::min (1.0, t / 0.02));
+    }
+
+    void play (int samples)
+    {
+        juce::MidiBuffer midi;
+        juce::AudioBuffer<float> buf (2, block);
+        for (int done = 0; done < samples; done += block)
+        {
+            for (int i = 0; i < block; ++i) { const float v = nextVoice(); buf.setSample (0, i, v); buf.setSample (1, i, v); }
+            proc.processBlock (buf, midi);
+            l.insert (l.end(), buf.getReadPointer (0), buf.getReadPointer (0) + block);
+            r.insert (r.end(), buf.getReadPointer (1), buf.getReadPointer (1) + block);
+            if (head.playing)
+            {
+                head.ppq += block * head.bpm / (60.0 * kFs);
+                if (loopBeats > 0.0 && head.ppq >= loopBeats) { head.ppq = 0.0; wraps.push_back ((int) l.size()); }
+            }
+        }
+    }
+
+    // Worst event / reference ratio for the events at `at` (sample positions).
+    // The reference is the sharpest the sound gets between events, away from them.
+    std::vector<float> judge (const std::vector<int>& at, int before, int after) const
+    {
+        std::vector<float> d (l.size(), 0.0f);
+        for (size_t i = 2; i < l.size(); ++i)
+            d[i] = std::max (std::abs (l[i] - 2 * l[i - 1] + l[i - 2]), std::abs (r[i] - 2 * r[i - 1] + r[i - 2]));
+        auto sharpest = [&] (int a, int b)
+        {
+            a = std::max (a, 2); b = std::min (b, (int) d.size());
+            return a < b ? *std::max_element (d.begin() + a, d.begin() + b) : 0.0f;
+        };
+        std::vector<float> out;
+        for (int e : at)
+        {
+            // Event window: ~85 ms from the change (covers the whole fade, swap and fade-in).
+            constexpr int win = 4096, gap = 512;
+            const float ref = std::max (sharpest (e - before + win, e - gap), sharpest (e + win, e + after - gap)) + 1.0e-6f;
+            out.push_back (sharpest (e - 16, e + win) / ref);
+        }
+        return out;
+    }
+};
+
+// Every parameter changed by hand while singing: switches and choices flipped,
+// knobs jumped end to end (a host can step automation like that). On Init the
+// held vowel is clean, so this runs in CI ("full" turns every voice and stage
+// on: a busier texture that is useful to listen to, but whose own sharpest
+// moments vary by up to ~1.5x, so it is a diagnostic only).
+void paramEdits (bool full, juce::StringArray& names, std::vector<float>& ratios)
+{
+    StaticSession s;
+    if (full)   // every voice and stage on, Classic character, shifted
+        for (auto [prm, v] : std::vector<std::pair<P, float>> {
+                 { P::vbOn, 1.0f }, { P::h1On, 1.0f }, { P::h2On, 1.0f }, { P::h3On, 1.0f }, { P::dbOn, 1.0f },
+                 { P::character, 1.0f }, { P::transpose, -5.0f }, { P::grit, 0.3f }, { P::formant, 2.0f } })
+            setParam (s.proc, prm, v);
+    const int seg = 24 * s.block;
+    std::vector<int> at;
+    s.play (seg);
+    for (int i = 0; i < kNumParams; ++i)
+    {
+        const auto& d = def (i);
+        if (d.p == P::seed || d.p == P::tempo) continue;
+        const float cur = s.proc.apvts.getRawParameterValue (d.id)->load();
+        const float to = d.kind == Kind::flt ? (std::abs (cur - d.max) > std::abs (cur - d.min) ? d.max : d.min)
+                                             : (cur < d.max ? cur + 1.0f : d.min);
+        at.push_back ((int) s.l.size()); names.add (juce::String (d.id) + " -> " + juce::String (to));
+        setParam (s.proc, d.p, to);
+        s.play (seg);
+        at.push_back ((int) s.l.size()); names.add (juce::String (d.id) + " back");
+        setParam (s.proc, d.p, cur);
+        s.play (seg);
+    }
+    ratios = s.judge (at, seg, seg);
+}
+
+constexpr float kLimit = 1.25f;   // click bar: same as Starfire and Possession
+
+int checkStatic()
+{
+    int failures = 0;
+    float worstAll = 0.0f;
+    const bool verbose = std::getenv ("LODESTONE_VERBOSE") != nullptr;
+    auto report = [&] (const juce::String& group, const juce::StringArray& names, const std::vector<float>& ratios,
+                       float limit = kLimit)
+    {
+        int bad = 0;
+        float worst = 0.0f;
+        for (size_t k = 0; k < ratios.size(); ++k)
+        {
+            worst = std::max (worst, ratios[k]);
+            const bool click = ratios[k] >= limit;
+            bad += click ? 1 : 0;
+            if (click || verbose) std::printf ("  %-40s %6.2f%s\n", names[(int) k].toRawUTF8(), ratios[k], click ? "  CLICK" : "");
+        }
+        if (limit == kLimit) worstAll = std::max (worstAll, worst);
+        failures += bad;
+        std::printf ("%-28s %3d event(s), %2d click(s), worst %.2fx\n", group.toRawUTF8(), (int) ratios.size(), bad, worst);
+    };
+
+    // 1. Sound changes while singing: every factory preset, Dice, A/B, undo and a host load.
+    for (int block : { 512, 96 })   // a typical buffer and a small, odd one
+    {
+        StaticSession s (block);
+        const int seg = 12288;   // ~0.26 s per sound
+        std::vector<int> at;
+        juce::StringArray names;
+        auto change = [&] (const juce::String& name, const std::function<void()>& f)
+        {
+            at.push_back ((int) s.l.size());
+            names.add (name);
+            f();
+            // The change must be heard in full within ~64 ms (fade 20 + hold 10 + fade 20).
+            s.play (3072);
+            if (s.proc.getSoundTransition() != 0.0f)
+            {
+                std::printf ("  %-40s not settled after 64 ms\n", name.toRawUTF8());
+                ++failures;
+            }
+            s.play (seg - 3072);
+        };
+        s.play (seg);
+        const auto& entries = s.proc.presets.getEntries();
+        for (int i = 0; i < entries.size(); ++i)
+            if (entries[i].factoryIndex >= 0)
+                change ("preset " + entries[i].name, [&] { s.proc.presets.load (i); });
+        for (int k = 1; k <= 8; ++k)
+            change ("Dice " + juce::String (k), [&] { s.proc.presets.randomize ((std::uint32_t) (k * 1013)); });
+        s.proc.presets.copyActiveToOther();
+        change ("Dice into B", [&] { s.proc.presets.selectSlot (1); s.proc.presets.randomize (4242); });
+        change ("A/B to A", [&] { s.proc.presets.selectSlot (0); });
+        change ("A/B to B", [&] { s.proc.presets.selectSlot (1); });
+        change ("preset 3 (for undo)", [&] { s.proc.presets.load (3); });
+        change ("undo preset load", [&] { s.proc.undoEdit(); });
+        change ("redo preset load", [&] { s.proc.redoEdit(); });
+        juce::MemoryBlock saved;
+        {
+            LodestoneProcessor other;
+            other.presets.load (entries.size() > 12 ? 12 : 1);
+            other.getStateInformation (saved);
+        }
+        change ("host loads a session", [&] { s.proc.setStateInformation (saved.getData(), (int) saved.getSize()); });
+        report ("Sound changes (block " + juce::String (block) + ")", names, s.judge (at, seg, seg));
+    }
+
+    // 2. Loop wraps: a 1-bar loop at 120 bpm with tempo-synced LFOs. The factory
+    //    Throat Sweep (2-bar LFO, so each wrap lands half a cycle away) plus
+    //    synced LFOs on throat, pan, mix, double and harmony levels.
+    {
+        struct Patch { juce::String name; int preset; std::function<void (LodestoneProcessor&)> setup; };
+        std::vector<Patch> patches;
+        int throat = -1;
+        {
+            LodestoneProcessor tmp;
+            const auto& e = tmp.presets.getEntries();
+            for (int i = 0; i < e.size(); ++i) if (e[i].name == "Throat Sweep") throat = i;
+        }
+        patches.push_back ({ "Throat Sweep", throat, {} });
+        namespace Div = dsp::Div;
+        using LS = dsp::LfoShape;
+        auto lfoTo = [] (LS shape, int div, std::vector<std::pair<P, float>> routes, std::vector<std::pair<P, float>> extra = {})
+        {
+            return [=] (LodestoneProcessor& p)
+            {
+                setParam (p, P::lfo1Shape, (float) shape);
+                setParam (p, P::lfo1Sync, 1.0f);
+                setParam (p, P::lfo1Div, (float) div);
+                for (auto [prm, v] : extra) setParam (p, prm, v);
+                for (auto [prm, a] : routes) p.addRoute (Src::lfo1, idx (prm), a);
+            };
+        };
+        patches.push_back ({ "sync tri -> throat (2 bars)", 0, lfoTo (LS::triangle, Div::bars2, { { P::formant, 0.4f } }) });
+        patches.push_back ({ "sync sine -> width/mix (2 bars)", 0, lfoTo (LS::sine, Div::bars2, { { P::width, 0.5f }, { P::mix, -0.4f } }) });
+        patches.push_back ({ "sync S&H -> throat (1/2)", 0, lfoTo (LS::sampleHold, Div::d2, { { P::formant, 0.3f } }) });
+        patches.push_back ({ "sync saw -> double/harmony (2 bars)", 0,
+                             lfoTo (LS::sawUp, Div::bars2, { { P::dbLevel, 0.5f }, { P::h1Level, 0.5f } },
+                                    { { P::dbOn, 1.0f }, { P::h1On, 1.0f }, { P::h1Interval, (float) dsp::Ivl::fifthUp } }) });
+        juce::StringArray names;
+        std::vector<float> ratios;
+        for (int block : { 512, 1000 })
+        for (const auto& pt : patches)
+        {
+            StaticSession s (block);
+            s.proc.presets.load (std::max (0, pt.preset));
+            if (pt.setup) pt.setup (s.proc);
+            s.head.playing = true;
+            s.loopBeats = 4.0;   // one bar
+            s.play ((int) (kFs * 0.4));
+            s.wraps.clear();
+            s.play ((int) (kFs * 6.2));   // three wraps
+            const auto rr = s.judge (s.wraps, (int) (kFs * 1.5), (int) (kFs * 1.5));
+            for (size_t k = 0; k < rr.size(); ++k)
+            { names.add (pt.name + " wrap " + juce::String ((int) k + 1) + " (block " + juce::String (block) + ")"); ratios.push_back (rr[k]); }
+        }
+        report ("Loop wraps", names, ratios);
+    }
+
+    // 3. Transport restarts over sound: the host reports "stopped" for a block
+    //    (Serato does this when a loop restarts) and starts again from bar 1;
+    //    also a plain stop and start mid-phrase.
+    {
+        juce::StringArray names;
+        std::vector<float> ratios;
+        for (int preset : { 0, 1 })
+        {
+            StaticSession s;
+            if (preset != 0)
+            {
+                const auto& e = s.proc.presets.getEntries();
+                for (int i = 0; i < e.size(); ++i) if (e[i].name == "Throat Sweep") s.proc.presets.load (i);
+            }
+            s.head.playing = true;
+            s.play ((int) (kFs * 1.3));
+            std::vector<int> at;
+            for (int k = 0; k < 3; ++k)
+            {
+                s.head.playing = false;
+                at.push_back ((int) s.l.size());
+                s.play (s.block);
+                s.head.playing = true;
+                s.head.ppq = 0.0;
+                s.play ((int) (kFs * 1.3));
+            }
+            const auto rr = s.judge (at, (int) (kFs * 1.0), (int) (kFs * 1.0));
+            for (size_t k = 0; k < rr.size(); ++k)
+            { names.add ((preset == 0 ? juce::String ("Init") : juce::String ("Throat Sweep")) + " restart " + juce::String ((int) k + 1)); ratios.push_back (rr[k]); }
+        }
+        report ("Transport restarts", names, ratios);
+    }
+
+
+    // 4. Each factory preset on a held note (no events): the output must not crackle.
+    //    Measured as the sharpest moment against the 99th percentile of sharpness
+    //    over the same 1.5 s: a steady voice is periodic, so a crackle stands out.
+    {
+        juce::StringArray names;
+        std::vector<float> ratios;
+        StaticSession probe;
+        const auto& e = probe.proc.presets.getEntries();
+        for (int i = 0; i < e.size(); ++i)
+        {
+            if (e[i].factoryIndex < 0) continue;
+            StaticSession s;
+            s.proc.presets.load (i);
+            s.play ((int) (kFs * 2.0));
+            std::vector<float> d;
+            for (size_t k = (size_t) (kFs * 0.5); k < s.l.size(); ++k)
+                d.push_back (std::max (std::abs (s.l[k] - 2 * s.l[k - 1] + s.l[k - 2]), std::abs (s.r[k] - 2 * s.r[k - 1] + s.r[k - 2])));
+            auto sorted = d;
+            std::nth_element (sorted.begin(), sorted.begin() + (long) (sorted.size() * 99 / 100), sorted.end());
+            const float p99 = sorted[sorted.size() * 99 / 100] + 1.0e-6f;
+            names.add ("held note: " + e[i].name);
+            ratios.push_back (*std::max_element (d.begin(), d.end()) / p99);
+        }
+        // A clean held voice peaks at ~1.1-1.6x its 99th percentile; a crackle is far above.
+        report ("Held notes (peak/p99)", names, ratios, 2.5f);
+    }
+
+    // 5. Knob jumps and switches on Init (Lead, Grit and Throat stepped in one sample in 1.0.0).
+    {
+        juce::StringArray names;
+        std::vector<float> ratios;
+        paramEdits (false, names, ratios);
+        report ("Knob jumps and switches", names, ratios);
+    }
+
+    std::printf ("worst event %.2fx (limit %.2fx)\n%d static check(s) failed\n", worstAll, kLimit, failures);
+    return failures == 0 ? 0 : 1;
+}
+
+
 int snapshot (const juce::String& path, int width, const juce::String& view, int presetIndex)
 {
     LodestoneProcessor proc;
@@ -430,7 +766,16 @@ int main (int argc, char** argv)
                          argc > 5 ? juce::String (argv[5]).getIntValue() : -1);
     if (mode == "presets") return checkPresets();
     if (mode == "state")   return checkState();
+    if (mode == "static")  return checkStatic();
+    if (mode == "edits")
+    {
+        juce::StringArray names;
+        std::vector<float> ratios;
+        paramEdits (argc > 2 && juce::String (argv[2]) == "full", names, ratios);
+        for (size_t k = 0; k < ratios.size(); ++k) std::printf ("%-40s %6.2f\n", names[(int) k].toRawUTF8(), ratios[k]);
+        return 0;
+    }
 
-    std::printf ("usage: lodestone_check snapshot <out.png> [width] [easy|easy-snap|tune|voice|harmony|mod|global] [preset] | presets | state\n");
+    std::printf ("usage: lodestone_check snapshot <out.png> [width] [easy|easy-snap|tune|voice|harmony|mod|global] [preset] | presets | state | static\n");
     return 2;
 }

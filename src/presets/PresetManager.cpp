@@ -61,6 +61,7 @@ void PresetManager::step (int delta)
 
 void PresetManager::applyTree (const ValueTree& tree, const String& name)
 {
+    lowkei::SoundChangeGate::Scope change (proc.soundGate);   // fade, swap every setting at once, fade
     proc.undo.beginNewTransaction ("Load " + name);
     auto t = tree.createCopy();
     t.setProperty (LodestoneProcessor::kPresetNameProp, name, nullptr);
@@ -212,6 +213,7 @@ void PresetManager::selectSlot (int slot)
     if (slot == activeSlot) return;
     slots[activeSlot] = proc.getPatchState();
     if (! slots[slot].isValid()) slots[slot] = slots[activeSlot].createCopy();
+    lowkei::SoundChangeGate::Scope change (proc.soundGate);   // fade, swap every setting at once, fade
     proc.undo.beginNewTransaction ("A/B");
     proc.applyPatchState (slots[slot].createCopy(), true);
     activeSlot = slot;

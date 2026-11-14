@@ -3,6 +3,8 @@
 // (harmonics shaped by fixed formants, optional vibrato and glides), block
 // rendering like a host, and measurements (pitch, level, spectral centroid).
 
+#include "dsp/ModSources.h"
+#include "dsp/OutputStage.h"
 #include "dsp/VoiceEngine.h"
 
 #include <cmath>

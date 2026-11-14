@@ -1,6 +1,8 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+#include <optional>
+
 namespace lodestone
 {
 using namespace juce;
@@ -75,12 +77,17 @@ void LodestoneProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     held.fill (false);
     heldOrder.clear();
     setLatencySamples (engine.getLatency());
+    wasPlaying = false;
+    lastBlockPeak = 0.0f;
+    holdingSound = false;
+    seenSoundChange = soundGate.current();   // a change made while not playing is simply current
 
     // Prime the engine with the current settings so nothing glides from zero.
     dsp::Transport t;
     t.sampleRate = sampleRate;
     t.bpm = raw[(size_t) idx (P::tempo)]->load();
     runControl (kControlBlock, 0.0f, t);
+    engine.snapToTargets();   // levels and glides start at the session's settings, not the defaults
 }
 
 void LodestoneProcessor::reset()
@@ -104,6 +111,31 @@ void LodestoneProcessor::syncLatencyFromState()
     lowLatencyWanted.store (live);
     // Reported at once; the audio thread switches its delay on the next block.
     setLatencySamples (latencyFor (sampleRateHz, live));
+}
+
+// ---------------------------------------------------------------------------
+// Undo / redo: stepping over a preset load or an A/B switch is a whole new
+// sound, so it goes through the sound-change gate like the load itself.
+namespace
+{
+bool isSoundChange (const String& description)
+{
+    return description.startsWith ("Load ") || description == "A/B";
+}
+} // namespace
+
+void LodestoneProcessor::undoEdit()
+{
+    std::optional<lowkei::SoundChangeGate::Scope> change;
+    if (isSoundChange (undo.getUndoDescription())) change.emplace (soundGate);
+    undo.undo();
+}
+
+void LodestoneProcessor::redoEdit()
+{
+    std::optional<lowkei::SoundChangeGate::Scope> change;
+    if (isSoundChange (undo.getRedoDescription())) change.emplace (soundGate);
+    undo.redo();
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +333,10 @@ void LodestoneProcessor::setStateInformation (const void* data, int sizeInBytes)
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
         if (xml->hasTagName (stateGuard.stateType()))
         {
-            applyPatchState (ValueTree::fromXml (*xml), false);
+            {
+                lowkei::SoundChangeGate::Scope change (soundGate);   // a new sound: fade, swap, fade
+                applyPatchState (ValueTree::fromXml (*xml), false);
+            }
             updateHostDisplay (ChangeDetails().withProgramChanged (true));
             MessageManager::callAsync ([safe = WeakReference<LodestoneProcessor> (this)]
             {
@@ -374,7 +409,31 @@ void LodestoneProcessor::runControl (int len, float inPeak, const dsp::Transport
     uiEnv.store (srcVal[(int) Src::env], std::memory_order_relaxed);
     uiDrift.store (srcVal[(int) Src::drift], std::memory_order_relaxed);
 
-    pushEngineParams();
+    // During a sound change the engine keeps the old settings until the swap.
+    if (! holdingSound) pushEngineParams();
+}
+
+// Once per control block, before runControl (see SoundChangeGate.h). Returns
+// true on the block where the new sound is taken.
+bool LodestoneProcessor::updateSoundChange()
+{
+    const auto change = soundGate.current();
+    if (! holdingSound && change != seenSoundChange)
+    {
+        holdingSound = true;           // keep the old sound, fade to the dry voice
+        output.setTransition (true);
+    }
+    if (holdingSound && ! soundGate.busy() && output.readyForSwap())
+    {
+        // Fully dry and every setting written: take the whole new sound at once
+        // (runControl, next, reads and pushes every setting).
+        seenSoundChange = change;
+        holdingSound = false;
+        engine.snapToTargets();        // voices, glides and levels jump to the new sound (unheard)
+        output.setTransition (false);  // fade the new sound in
+        return true;
+    }
+    return false;
 }
 
 void LodestoneProcessor::pushEngineParams()
@@ -531,6 +590,19 @@ void LodestoneProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& m
     t.playing = playing && hasPpq;
     t.ppq = t.playing ? hostPpq : freePpq;
 
+    // The playhead moved under us: a loop wrapping round or a locate while playing
+    // (more than ~1.3 ms from where the last block ended), or the transport starting
+    // somewhere else while the voice is sounding. Synced LFOs ease across it. Starting
+    // from silence stays exact, so playback still matches a bounce.
+    {
+        const bool jumped = t.playing && wasPlaying && std::abs (hostPpq - expectedPpq) > 64.0 * t.beatsPerSample();
+        const bool startedOverSound = t.playing && ! wasPlaying && lastBlockPeak > 3.0e-5f
+                                   && std::abs (hostPpq - freePpq) > 64.0 * t.beatsPerSample();
+        if (jumped || startedOverSound)
+            for (auto& l : lfos) l.easeNextJump();
+        wasPlaying = t.playing;
+    }
+
     if (scratch.getNumSamples() < n) scratch.setSize (4, n, false, false, true);   // host exceeded its block size
     float* mono = scratch.getWritePointer (0);
     float* dryL = scratch.getWritePointer (1);
@@ -556,7 +628,9 @@ void LodestoneProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& m
         for (int k = 0; k < len; ++k) pk = std::max (pk, std::abs (mono[start + k]));
         inPeakBlock = std::max (inPeakBlock, pk);
 
+        const bool swapped = updateSoundChange();
         runControl (len, pk, t);
+        if (swapped) output.snapWet();   // width and mix start at the new sound's values
         engine.process (mono + start, wetL + start, wetR + start, dryL + start, len);
         output.process (dryL + start, dryL + start, wetL + start, wetR + start, len);
         grMin = std::min (grMin, output.gainReduction());
@@ -576,6 +650,8 @@ void LodestoneProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& m
         }
     }
     freePpq = t.ppq;
+    expectedPpq = t.ppq;
+    lastBlockPeak = inPeakBlock;
 
     for (int k = 0; k < n; ++k)
     {
