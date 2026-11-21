@@ -45,6 +45,7 @@ namespace Choices
         return s;
     }();
     const juce::StringArray lfoShapes { "Sine", "Triangle", "Saw Up", "Saw Down", "Square", "S&H", "Smooth Rnd" };
+    const juce::StringArray motionStarts { "Grid", "Phrase" };
 }
 
 namespace
@@ -159,6 +160,32 @@ const std::vector<ParamDef>& table()
         F (P::dbDetune, "db_detune", "Double Detune", "Detune", 0, 30, 8, 10, U::cents, true, "How far out of tune each take is (in cents)"),
         F (P::dbDelay,  "db_delay",  "Double Delay", "Delay", 5, 60, 18, 20, U::ms, true, "How late the takes come in"),
 
+        // Beat (v2) -----------------------------------------------------------------------------------
+        F (P::chordLock, "chord_lock", "Chord Lock", "Chord Lock", 0, 1, 0, 0, U::pct, true,
+           "Pulls notes onto the chord the beat is playing (route the beat to the sidechain). 50%: notes a semitone off a chord tone move to it; 100%: chord tones only"),
+        B (P::motionOn,  "motion_on", "Motion On", "Motion", false, "Motion: a tempo-synced pattern that moves each note up and down the scale"),
+        C (P::motionRate, "motion_rate", "Motion Rate", "Rate", divisions, dsp::Div::d8, "How long each step of the pattern lasts"),
+        I (P::motionLength, "motion_length", "Motion Steps", "Steps", 1, 16, 8, U::plain, "How many steps the pattern has before it repeats"),
+        F (P::motionGlide, "motion_glide", "Motion Glide", "Glide", 0, 200, 12, 30, U::ms, true, "How smoothly the voice moves from step to step (0 ms = jumps)"),
+        C (P::motionStart, "motion_start", "Motion Start", "Start", motionStarts, 1,
+           "Phrase: the pattern starts at step 1 whenever singing starts. Grid: it follows the song's bars"),
+        I (P::mStep1, "motion_s1", "Motion Step 1", "1", -12, 12, 0, U::steps, "Notes up or down the scale for this step (0 = the sung note)"),
+        I (P::mStep2, "motion_s2", "Motion Step 2", "2", -12, 12, 2, U::steps, "Notes up or down the scale for this step (0 = the sung note)"),
+        I (P::mStep3, "motion_s3", "Motion Step 3", "3", -12, 12, 4, U::steps, "Notes up or down the scale for this step (0 = the sung note)"),
+        I (P::mStep4, "motion_s4", "Motion Step 4", "4", -12, 12, 2, U::steps, "Notes up or down the scale for this step (0 = the sung note)"),
+        I (P::mStep5, "motion_s5", "Motion Step 5", "5", -12, 12, 0, U::steps, "Notes up or down the scale for this step (0 = the sung note)"),
+        I (P::mStep6, "motion_s6", "Motion Step 6", "6", -12, 12, 2, U::steps, "Notes up or down the scale for this step (0 = the sung note)"),
+        I (P::mStep7, "motion_s7", "Motion Step 7", "7", -12, 12, 4, U::steps, "Notes up or down the scale for this step (0 = the sung note)"),
+        I (P::mStep8, "motion_s8", "Motion Step 8", "8", -12, 12, 7, U::steps, "Notes up or down the scale for this step (0 = the sung note)"),
+        I (P::mStep9, "motion_s9", "Motion Step 9", "9", -12, 12, 0, U::steps, "Notes up or down the scale for this step (0 = the sung note)"),
+        I (P::mStep10, "motion_s10", "Motion Step 10", "10", -12, 12, 0, U::steps, "Notes up or down the scale for this step (0 = the sung note)"),
+        I (P::mStep11, "motion_s11", "Motion Step 11", "11", -12, 12, 0, U::steps, "Notes up or down the scale for this step (0 = the sung note)"),
+        I (P::mStep12, "motion_s12", "Motion Step 12", "12", -12, 12, 0, U::steps, "Notes up or down the scale for this step (0 = the sung note)"),
+        I (P::mStep13, "motion_s13", "Motion Step 13", "13", -12, 12, 0, U::steps, "Notes up or down the scale for this step (0 = the sung note)"),
+        I (P::mStep14, "motion_s14", "Motion Step 14", "14", -12, 12, 0, U::steps, "Notes up or down the scale for this step (0 = the sung note)"),
+        I (P::mStep15, "motion_s15", "Motion Step 15", "15", -12, 12, 0, U::steps, "Notes up or down the scale for this step (0 = the sung note)"),
+        I (P::mStep16, "motion_s16", "Motion Step 16", "16", -12, 12, 0, U::steps, "Notes up or down the scale for this step (0 = the sung note)"),
+
         // Modulation sources ---------------------------------------------------------------------------
         C (P::lfo1Shape, "lfo1_shape", "LFO 1 Shape", "Shape", lfoShapes, 0, "LFO 1 waveform"),
         F (P::lfo1Rate,  "lfo1_rate",  "LFO 1 Rate", "Rate", 0.01f, 20, 0.5f, 1.0f, U::hz, true, "LFO 1 speed"),
@@ -230,6 +257,7 @@ juce::String formatValue (const ParamDef& d, float v)
         {
             const int k = juce::roundToInt (v);
             if (d.unit == Unit::semis) return (k > 0 ? "+" : "") + String (k) + " st";
+            if (d.unit == Unit::steps) return (k > 0 ? "+" : "") + String (k);
             return String (k);
         }
         case Kind::flt:     break;
@@ -253,6 +281,7 @@ juce::String formatValue (const ParamDef& d, float v)
         case Unit::semis:      { const float r = std::round (v * 10.0f) / 10.0f; return (r > 0 ? "+" : "") + String (r, 1) + " st"; }
         case Unit::cents:      { const int k = juce::roundToInt (v); return (k > 0 ? "+" : "") + String (k) + " ct"; }
         case Unit::bpm:        return String (v, 1) + " bpm";
+        case Unit::steps:      { const int k = juce::roundToInt (v); return (k > 0 ? "+" : "") + String (k); }
         case Unit::plain:      return fmtSplit (v, 10.0f, 1, 0);
     }
     return String (v);
@@ -311,7 +340,11 @@ juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
             {
                 auto attrs = AudioParameterIntAttributes()
                                  .withStringFromValueFunction ([&d] (int v, int) { return formatValue (d, (float) v); })
-                                 .withValueFromStringFunction ([] (const String& s) { return s.getIntValue(); });
+                                 .withValueFromStringFunction ([] (const String& s)
+                                 {
+                                     // getIntValue() stops at a leading '+' ("+3 st" would read as 0).
+                                     return s.trim().trimCharactersAtStart ("+").getIntValue();
+                                 });
                 layout.add (std::make_unique<AudioParameterInt> (pid, d.name, (int) d.min, (int) d.max, (int) dflt, attrs));
                 break;
             }
@@ -328,6 +361,7 @@ const StageInfo kStages[kNumStages] = {
     { "Harmony 2",  "A second harmony voice",                      P::h2On },
     { "Harmony 3",  "A third harmony voice",                       P::h3On },
     { "Double",     "Two extra takes for a thick, wide lead",      P::dbOn },
+    { "Motion",     "Tempo-synced note patterns: trills, arps and hops, in key", P::motionOn },
 };
 
 const juce::StringArray& sourceNames()

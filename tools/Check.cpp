@@ -1,7 +1,7 @@
 // lodestone_check: headless verification of the real processor + editor.
 //
 //   lodestone_check snapshot <out.png> [width] [view] [preset]
-//        view: easy | easy-snap | tune | voice | harmony | mod | global
+//        view: easy | easy-snap | tune | voice | harmony | beat | mod | global
 //   lodestone_check presets   every factory preset on a sung melody: as saved,
 //                             with SNAP, with HOLD and with all four macros at
 //                             100%: no NaN, no clipping past the limiter, no
@@ -14,6 +14,9 @@
 //                             synced LFOs, transport restarts over sound,
 //                             every factory preset on a held note, every knob
 //                             jumped and every switch flipped on Init
+//   lodestone_check beat      v2: sidechain bus layouts, Chord Lock end to end,
+//                             LEARN from the beat, Motion on the host's grid,
+//                             and a 1.x project loading with both off
 //   lodestone_check edits [full]  diagnostic: the click ratio of every edit
 //
 // Exits non-zero on any failure: CI treats that as a failed build.
@@ -384,6 +387,7 @@ int checkState()
 }
 
 
+
 // ---------------------------------------------------------------------------
 // Static report (Serato, Nov 2026, the whole LowKei family): clicks on loop
 // restarts, transport restarts and preset changes. Every scenario plays a
@@ -407,6 +411,262 @@ struct TestPlayHead : juce::AudioPlayHead
         return i;
     }
 };
+
+// ---------------------------------------------------------------------------
+// v2: the beat. A synthetic beat (pad chord, bass, kick and hats) on the
+// sidechain, a sung voice on the main input, through the real processor.
+
+std::vector<float> beatAudio (const std::vector<std::pair<int, int>>& chords, double secondsEach)
+{
+    const size_t total = (size_t) ((double) chords.size() * secondsEach * kFs);
+    std::vector<float> x (total);
+    juce::Random rng (11);
+    double ph[5] {};
+    for (size_t i = 0; i < total; ++i)
+    {
+        const double t = (double) i / kFs;
+        const auto [root, shape] = chords[(size_t) (t / secondsEach)];
+        const auto& sh = dsp::kChordShapes[shape];
+        double s = 0.0;
+        for (int k = 0; k < sh.count; ++k)
+        {
+            const double f = 440.0 * std::pow (2.0, ((60 + (root + sh.tones[(size_t) k]) % 12) - 69) / 12.0);
+            ph[k] += f / kFs;
+            ph[k] -= std::floor (ph[k]);
+            for (int h = 1; h < 8; ++h) s += 0.15 / h * std::sin (2.0 * juce::MathConstants<double>::pi * h * ph[k]);
+        }
+        const double fb = 440.0 * std::pow (2.0, (36 + root - 69) / 12.0);
+        ph[4] += fb / kFs;
+        ph[4] -= std::floor (ph[4]);
+        s += 0.5 * std::sin (2.0 * juce::MathConstants<double>::pi * ph[4]);
+        const double bt = std::fmod (t, 0.5), ht = std::fmod (t, 0.25);
+        s += 0.8 * std::exp (-bt * 30.0) * std::sin (2.0 * juce::MathConstants<double>::pi * 55.0 * bt * (1.0 + 2.0 * std::exp (-bt * 40.0)));
+        s += 0.15 * std::exp (-ht * 80.0) * (rng.nextFloat() * 2.0f - 1.0f);
+        x[i] = (float) (0.25 * s);
+    }
+    return x;
+}
+
+// A steady sung vowel at `midi` (no vibrato), `seconds` long.
+std::vector<float> heldVowel (double midi, double seconds)
+{
+    std::vector<double> notes { midi };
+    auto v = sungMelody (seconds, notes, seconds + 1.0);
+    return v;
+}
+
+// Main input (voice, both channels) + sidechain (beat, both channels), 4-channel buffer.
+std::vector<float> renderWithBeat (LodestoneProcessor& proc, const std::vector<float>& voice, const std::vector<float>& beat,
+                                   TestPlayHead* head = nullptr, int block = 512)
+{
+    proc.prepareToPlay (kFs, block);
+    proc.reset();
+    juce::MidiBuffer midi;
+    const int total = (int) voice.size();
+    juce::AudioBuffer<float> buf (4, block);
+    std::vector<float> out;
+    out.reserve ((size_t) total);
+    for (int pos = 0; pos < total; pos += block)
+    {
+        const int n = std::min (block, total - pos);
+        buf.setSize (4, n, false, false, true);
+        for (int s = 0; s < n; ++s)
+        {
+            const float v = voice[(size_t) (pos + s)];
+            const float b = (size_t) (pos + s) < beat.size() ? beat[(size_t) (pos + s)] : 0.0f;
+            buf.setSample (0, s, v); buf.setSample (1, s, v);
+            buf.setSample (2, s, b); buf.setSample (3, s, b);
+        }
+        if (head != nullptr) proc.setPlayHead (head);
+        proc.processBlock (buf, midi);
+        if (head != nullptr) head->ppq += head->bpm / 60.0 * n / kFs;
+        for (int s = 0; s < n; ++s) out.push_back (0.5f * (buf.getSample (0, s) + buf.getSample (1, s)));
+    }
+    return out;
+}
+
+bool enableSidechain (LodestoneProcessor& p, juce::AudioChannelSet main, juce::AudioChannelSet sc)
+{
+    auto layout = p.getBusesLayout();
+    layout.inputBuses.getReference (0) = main;
+    layout.outputBuses.getReference (0) = juce::AudioChannelSet::stereo();
+    layout.inputBuses.getReference (1) = sc;
+    return p.setBusesLayout (layout);
+}
+
+int checkBeat()
+{
+    int failures = 0;
+    using CS = juce::AudioChannelSet;
+
+    // 1. Bus layouts: the sidechain is optional, mono or stereo; anything else is refused.
+    {
+        LodestoneProcessor p;
+        int bad = 0;
+        if (p.getBusCount (true) != 2) bad += fail ("a sidechain input bus exists");
+        if (! enableSidechain (p, CS::stereo(), CS::disabled())) bad += fail ("stereo in, no sidechain");
+        if (! enableSidechain (p, CS::stereo(), CS::stereo())) bad += fail ("stereo in, stereo sidechain");
+        if (! enableSidechain (p, CS::mono(), CS::stereo())) bad += fail ("mono in, stereo sidechain");
+        if (! enableSidechain (p, CS::stereo(), CS::mono())) bad += fail ("stereo in, mono sidechain");
+        if (enableSidechain (p, CS::stereo(), CS::create5point1())) bad += fail ("5.1 sidechain refused");
+        failures += bad;
+        std::printf ("sidechain bus layouts: %s\n", bad == 0 ? "ok" : "FAILED");
+    }
+
+    // 2. Chord Lock end to end: a sung F (65.2) over C major, then over D minor.
+    //    Lock 100%: over C it must land on a C chord tone (E, the nearest), over Dm it stays F.
+    //    Lock 0%: it stays F over both (1.x behaviour).
+    {
+        const auto beat = beatAudio ({ { 0, 0 }, { 2, 1 } }, 2.0);
+        const auto voice = heldVowel (65.2, 4.0);
+        for (const float lock : { 1.0f, 0.0f })
+        {
+            LodestoneProcessor p;
+            enableSidechain (p, CS::stereo(), CS::stereo());
+            setParam (p, P::retune, 5.0f);
+            setParam (p, P::flex, 0.0f);
+            setParam (p, P::humanize, 0.0f);
+            setParam (p, P::chordLock, lock);
+            const auto out = renderWithBeat (p, voice, beat);
+            const double overC = medianPitch (out, 1.0, 1.9), overDm = medianPitch (out, 3.2, 3.9);
+            const double wantC = lock > 0.5f ? 64.0 : 65.0;
+            const bool ok = std::abs (overC - wantC) < 0.08 && std::abs (overDm - 65.0) < 0.08;
+            std::printf ("chord lock %3.0f%%: sung 65.20 -> over C %.3f (want %.0f), over Dm %.3f (want 65): %s\n",
+                         lock * 100.0f, overC, wantC, overDm, ok ? "ok" : "FAILED");
+            if (! ok) ++failures;
+        }
+    }
+
+    // 3. The chord in use is shown, and the beat's chord survives a host stop/seek.
+    {
+        LodestoneProcessor p;
+        enableSidechain (p, CS::stereo(), CS::stereo());
+        setParam (p, P::chordLock, 0.6f);
+        renderWithBeat (p, heldVowel (60.0, 2.0), beatAudio ({ { 9, 1 } }, 2.0));
+        const int root = p.uiChordRoot.load(), shape = p.uiChordShape.load();
+        const bool shown = root == 9 && shape == 1 && p.uiChordInUse.load() == (int) dsp::chordMask (9, 1) && p.uiSidechainConnected.load();
+        p.reset();
+        const bool kept = p.getChordAnalyzer().chord().root == 9;
+        std::printf ("chord shown (Am) and kept across a host reset: %s\n", shown && kept ? "ok" : "FAILED");
+        if (! (shown && kept)) ++failures;
+    }
+
+    // 4. LEARN listens to the beat: A minor progression, the voice silent.
+    {
+        LodestoneProcessor p;
+        enableSidechain (p, CS::stereo(), CS::stereo());
+        p.clearKeyHistogram();
+        const auto beat = beatAudio ({ { 9, 1 }, { 2, 1 }, { 4, 0 }, { 9, 1 } }, 1.5);
+        renderWithBeat (p, std::vector<float> (beat.size(), 0.0f), beat);
+        const auto k = dsp::findKey (p.getKeyHistogram());
+        float total = 0.0f;
+        for (float v : p.getKeyHistogram()) total += v;
+        const bool ok = p.keyFromBeat() && k.key == 9 && k.minor && total >= 15.0f;
+        std::printf ("LEARN from the beat: %s %s, %.0f%% sure, evidence %.1f after 6 s (auto-set at 15): %s\n",
+                     dsp::noteName (k.key), k.minor ? "minor" : "major", k.confidence * 100.0f, total, ok ? "ok" : "FAILED");
+        if (! ok) ++failures;
+    }
+
+    // 5. No sidechain: nothing changes. Chord Lock at 100% with the bus off = the scale.
+    {
+        LodestoneProcessor p;
+        enableSidechain (p, CS::stereo(), CS::disabled());
+        setParam (p, P::chordLock, 1.0f);
+        setParam (p, P::retune, 5.0f);
+        setParam (p, P::flex, 0.0f);
+        const auto voice = heldVowel (65.2, 2.0);
+        std::vector<float> out;
+        {
+            p.prepareToPlay (kFs, 512);
+            juce::AudioBuffer<float> buf (2, 512);
+            juce::MidiBuffer midi;
+            for (size_t pos = 0; pos < voice.size(); pos += 512)
+            {
+                const int n = (int) std::min<size_t> (512, voice.size() - pos);
+                buf.setSize (2, n, false, false, true);
+                for (int s = 0; s < n; ++s) { buf.setSample (0, s, voice[pos + (size_t) s]); buf.setSample (1, s, voice[pos + (size_t) s]); }
+                p.processBlock (buf, midi);
+                for (int s = 0; s < n; ++s) out.push_back (buf.getSample (0, s));
+            }
+        }
+        const double got = medianPitch (out, 1.0, 1.9);
+        const bool ok = std::abs (got - 65.0) < 0.08 && ! p.uiSidechainConnected.load() && p.uiChordInUse.load() == 0;
+        std::printf ("no sidechain, Chord Lock 100%%: sung 65.20 -> %.3f (want 65, the scale): %s\n", got, ok ? "ok" : "FAILED");
+        if (! ok) ++failures;
+    }
+
+    // 6. Motion on the host's grid: steps 0, +2 (C major: C, E) at 1/8 note, 120 bpm.
+    {
+        LodestoneProcessor p;
+        setParam (p, P::retune, 0.0f);
+        setParam (p, P::flex, 0.0f);
+        setParam (p, P::humanize, 0.0f);
+        setParam (p, P::keep, 0.0f);
+        setParam (p, P::motionOn, 1.0f);
+        setParam (p, P::motionStart, 0.0f);      // Grid
+        setParam (p, P::motionRate, (float) dsp::Div::d8);
+        setParam (p, P::motionLength, 2.0f);
+        setParam (p, P::motionGlide, 0.0f);
+        setParam (p, motionStepParam (0), 0.0f);
+        setParam (p, motionStepParam (1), 2.0f);
+        TestPlayHead head;
+        head.playing = true;
+        head.ppq = 0.0;
+        const auto out = renderWithBeat (p, heldVowel (60.1, 3.0), {}, &head);
+        int bad = 0;
+        for (int k = 4; k < 10; ++k)   // eighth notes at 120 bpm: 0.25 s each
+        {
+            const double got = medianPitch (out, k * 0.25 + 0.06, k * 0.25 + 0.22);
+            const double want = (k % 2 == 0) ? 60.0 : 64.0;
+            if (std::abs (got - want) > 0.08) { ++bad; std::printf ("  step at %.2f s: %.3f (want %.0f)\n", k * 0.25, got, want); }
+        }
+        std::printf ("Motion on the grid (C, E, C, E... on eighth notes): %s\n", bad == 0 ? "ok" : "FAILED");
+        failures += bad > 0 ? 1 : 0;
+    }
+
+    // 7. A 1.x project (no v2 parameters saved) opens with Chord Lock 0 and Motion off,
+    //    even into an instance where they were on.
+    {
+        LodestoneProcessor a;
+        juce::MemoryBlock mb;
+        a.getStateInformation (mb);
+        auto xml = juce::AudioProcessor::getXmlFromBinary (mb.getData(), (int) mb.getSize());
+        auto tree = juce::ValueTree::fromXml (*xml);
+        for (int i = tree.getNumChildren(); --i >= 0;)
+        {
+            const auto id = tree.getChild (i).getProperty ("id").toString();
+            if (id == "chord_lock" || id.startsWith ("motion_")) tree.removeChild (i, nullptr);
+        }
+        juce::MemoryBlock old;
+        juce::AudioProcessor::copyXmlToBinary (*tree.createXml(), old);
+
+        LodestoneProcessor b;
+        setParam (b, P::motionOn, 1.0f);
+        setParam (b, P::chordLock, 0.8f);
+        b.setStateInformation (old.getData(), (int) old.getSize());
+        const bool ok = getParam (b, P::motionOn) < 0.5f && getParam (b, P::chordLock) < 1.0e-4f
+                     && (int) getParam (b, motionStepParam (2)) == 4;
+        std::printf ("1.x project loads with Chord Lock 0 and Motion off: %s\n", ok ? "ok" : "FAILED");
+        if (! ok) ++failures;
+    }
+
+    // 8. Whole-number controls read typed text with a sign ("+3 st" used to read as 0).
+    {
+        LodestoneProcessor p;
+        auto* tr = p.apvts.getParameter ("transpose");
+        auto* st = p.apvts.getParameter ("motion_s3");
+        const float t3 = tr->convertFrom0to1 (tr->getValueForText ("+3 st"));
+        const float s5 = st->convertFrom0to1 (st->getValueForText ("+5"));
+        const float sm = st->convertFrom0to1 (st->getValueForText ("-4"));
+        const bool ok = std::abs (t3 - 3.0f) < 0.01f && std::abs (s5 - 5.0f) < 0.01f && std::abs (sm + 4.0f) < 0.01f
+                     && st->getText (st->getValueForText ("+5"), 32) == "+5";
+        std::printf ("typed values with a sign (\"+3 st\" -> %.0f, \"+5\" -> %.0f, \"-4\" -> %.0f): %s\n", t3, s5, sm, ok ? "ok" : "FAILED");
+        if (! ok) ++failures;
+    }
+
+    std::printf ("%d beat check(s) failed\n", failures);
+    return failures == 0 ? 0 : 1;
+}
 
 struct StaticSession
 {
@@ -738,8 +998,9 @@ int snapshot (const juce::String& path, int width, const juce::String& view, int
     else if (view == "tune") content.showProPage (0);
     else if (view == "voice") content.showProPage (1);
     else if (view == "harmony") content.showProPage (2);
-    else if (view == "mod") content.showProPage (3);
-    else if (view == "global") content.showProPage (4);
+    else if (view == "beat") content.showProPage (3);
+    else if (view == "mod") content.showProPage (4);
+    else if (view == "global") content.showProPage (5);
     for (int k = 0; k < 4; ++k) content.tick();
 
     editor->setSize (width, width * LodestoneEditor::kDesignH / LodestoneEditor::kDesignW);
@@ -767,6 +1028,30 @@ int main (int argc, char** argv)
     if (mode == "presets") return checkPresets();
     if (mode == "state")   return checkState();
     if (mode == "static")  return checkStatic();
+    if (mode == "beat")    return checkBeat();
+    if (mode == "held" && argc > 2)   // diagnostic: where a preset's sharpest moments fall on a held note
+    {
+        StaticSession s;
+        const auto& e = s.proc.presets.getEntries();
+        for (int i = 0; i < e.size(); ++i) if (e[i].name == argv[2]) s.proc.presets.load (i);
+        s.play ((int) (kFs * 2.0));
+        std::vector<std::pair<float, int>> d;
+        for (size_t k = (size_t) (kFs * 0.5); k < s.l.size(); ++k)
+            d.push_back ({ std::max (std::abs (s.l[k] - 2 * s.l[k - 1] + s.l[k - 2]), std::abs (s.r[k] - 2 * s.r[k - 1] + s.r[k - 2])), (int) k });
+        auto sorted = d;
+        std::sort (sorted.begin(), sorted.end(), [] (auto a, auto b) { return a.first > b.first; });
+        const float p99 = sorted[sorted.size() / 100].first;
+        for (int k = 0; k < 12; ++k)
+            std::printf ("%8.4f s  %.2fx p99\n", sorted[(size_t) k].second / kFs, sorted[(size_t) k].first / p99);
+        if (argc > 3)
+        {
+            juce::File f (argv[3]);
+            f.deleteFile();
+            juce::FileOutputStream os (f);
+            for (size_t k = 0; k < s.l.size(); ++k) os << juce::String (s.l[k], 6) << "\n";
+        }
+        return 0;
+    }
     if (mode == "edits")
     {
         juce::StringArray names;
@@ -776,6 +1061,6 @@ int main (int argc, char** argv)
         return 0;
     }
 
-    std::printf ("usage: lodestone_check snapshot <out.png> [width] [easy|easy-snap|tune|voice|harmony|mod|global] [preset] | presets | state | static\n");
+    std::printf ("usage: lodestone_check snapshot <out.png> [width] [easy|easy-snap|tune|voice|harmony|beat|mod|global] [preset] | presets | state | static | beat\n");
     return 2;
 }

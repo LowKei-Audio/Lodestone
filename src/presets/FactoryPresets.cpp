@@ -11,6 +11,7 @@ namespace lodestone
 //   2 Throat - a longer throat and a little grit
 //   3 Choir  - the harmonies and the double that are switched on come up
 //   4 Width  - the double spreads and the voices widen
+// (v2: with Motion on, Pull also shortens Motion's glide)
 std::vector<Route> macroKit (const std::array<bool, kNumStages>& used)
 {
     std::vector<Route> r;
@@ -28,6 +29,8 @@ std::vector<Route> macroKit (const std::array<bool, kNumStages>& used)
 
     if (used[Stage::doubler]) r.push_back ({ Src::macro4, P::dbSpread, 0.35f });
     r.push_back ({ Src::macro4, P::width, 0.35f });
+    // v2: Pull also makes Motion snap from step to step.
+    if (used[Stage::motion]) r.push_back ({ Src::macro1, P::motionGlide, -0.3f });
     return r;
 }
 
@@ -232,6 +235,57 @@ std::vector<FactoryPreset> build()
         "Play chords: each held note (up to three) becomes a harmony voice around the lead.",
         { { P::midiMode, (float) Midi::harmony }, { P::harmHumanize, 0.4f }, { P::h1Level, 0.5f }, { P::h2Level, 0.5f },
           { P::h3Level, 0.45f }, { P::h1Pan, -0.6f }, { P::h2Pan, 0.6f } } });
+
+    // ======================================================================= Beat (v2: Chord Lock)
+    // These need the beat on Lodestone's sidechain input; without it they play
+    // like their tuning settings alone (the scale is used as set).
+    v.push_back ({ "Follow the Beat", "Beat",
+        "Natural tuning that leans onto the chord the beat is playing. Route the beat to the sidechain input.",
+        { { P::chordLock, 0.6f }, { P::retune, 25.0f }, { P::humanize, 0.3f }, { P::flex, 0.15f } } });
+    v.push_back ({ "Chord Robot", "Beat",
+        "Hard tune that only lands on the chord's notes: the melody locks to the beat's harmony. Needs the beat on the sidechain.",
+        { { P::chordLock, 1.0f }, { P::retune, 0.0f }, { P::humanize, 0.0f }, { P::flex, 0.0f }, { P::keep, 0.0f }, { P::stability, 0.35f } } });
+    v.push_back ({ "Chord Choir", "Beat",
+        "Two harmonies stacked on the chord the beat plays, plus an octave below: always the full chord, never a clash.",
+        { { P::chordLock, 0.7f }, { P::retune, 12.0f },
+          { P::h1On, on }, { P::h1Interval, (float) Ivl::thirdUp }, { P::h1Level, 0.5f }, { P::h1Pan, -0.55f },
+          { P::h2On, on }, { P::h2Interval, (float) Ivl::fifthUp }, { P::h2Level, 0.45f }, { P::h2Pan, 0.55f },
+          { P::h3On, on }, { P::h3Interval, (float) Ivl::octDown }, { P::h3Level, 0.35f }, { P::harmHumanize, 0.45f } } });
+    v.push_back ({ "Beat Hook", "Beat",
+        "Tight, doubled hook tuning that keeps every held note on the chord.",
+        { { P::chordLock, 0.5f }, { P::retune, 8.0f }, { P::keep, 0.4f }, { P::dbOn, on }, { P::dbLevel, 0.3f }, { P::dbSpread, 0.7f } } });
+
+    // ======================================================================= Motion (v2)
+    auto steps = [] (std::vector<int> s, std::vector<std::pair<P, float>> extra)
+    {
+        std::vector<std::pair<P, float>> out { { P::motionOn, on }, { P::motionLength, (float) s.size() } };
+        for (int i = 0; i < 16; ++i) out.push_back ({ motionStepParam (i), i < (int) s.size() ? (float) s[(size_t) i] : 0.0f });
+        out.insert (out.end(), extra.begin(), extra.end());
+        return out;
+    };
+    v.push_back ({ "Trill Lead", "Motion",
+        "Every note trills with the next note up the scale, in sixteenths.",
+        steps ({ 0, 1 }, { { P::motionRate, (float) Div::d16 }, { P::motionGlide, 15.0f }, { P::retune, 5.0f }, { P::keep, 0.2f } }) });
+    v.push_back ({ "Arp Rider", "Motion",
+        "Each held note becomes a rising arpeggio: root, third, fifth, octave.",
+        steps ({ 0, 2, 4, 7 }, { { P::motionRate, (float) Div::d16 }, { P::motionGlide, 8.0f }, { P::retune, 0.0f }, { P::keep, 0.0f },
+                                 { P::humanize, 0.0f } }) });
+    v.push_back ({ "Octave Hop", "Motion",
+        "Jumps up an octave on every other eighth, with a wide double.",
+        steps ({ 0, 7 }, { { P::motionRate, (float) Div::d8 }, { P::motionGlide, 25.0f }, { P::retune, 5.0f }, { P::dbOn, on },
+                           { P::dbLevel, 0.3f }, { P::dbSpread, 0.8f } }) });
+    v.push_back ({ "Stair Runner", "Motion",
+        "Climbs the scale a step every sixteenth, then starts again.",
+        steps ({ 0, 1, 2, 3, 4, 5, 6, 7 }, { { P::motionRate, (float) Div::d16 }, { P::motionGlide, 8.0f }, { P::retune, 0.0f },
+                                             { P::keep, 0.0f } }) });
+    v.push_back ({ "Call and Answer", "Motion",
+        "Holds the sung note, then answers it lower down: a melodic hook from one note. Locked to the bar.",
+        steps ({ 0, 0, 0, -3, 0, 0, -5, -7 }, { { P::motionRate, (float) Div::d8 }, { P::motionStart, 0.0f }, { P::motionGlide, 30.0f },
+                                                { P::retune, 10.0f } }) });
+    v.push_back ({ "Chord Arp", "Motion",
+        "With the beat on the sidechain, every held note arpeggiates the chord that is playing.",
+        steps ({ 0, 1, 2, 3 }, { { P::motionRate, (float) Div::d16 }, { P::motionGlide, 6.0f }, { P::chordLock, 1.0f }, { P::retune, 0.0f },
+                                 { P::keep, 0.0f } }) });
 
     return v;
 }

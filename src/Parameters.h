@@ -29,6 +29,10 @@ enum class P : int
     harmHumanize,
     // Doubler
     dbOn, dbLevel, dbSpread, dbDetune, dbDelay,
+    // Beat (v2): Chord Lock and the Motion pattern
+    chordLock, motionOn, motionRate, motionLength, motionGlide, motionStart,
+    mStep1, mStep2, mStep3, mStep4, mStep5, mStep6, mStep7, mStep8,
+    mStep9, mStep10, mStep11, mStep12, mStep13, mStep14, mStep15, mStep16,
     // Modulation sources
     lfo1Shape, lfo1Rate, lfo1Sync, lfo1Div,
     lfo2Shape, lfo2Rate, lfo2Sync, lfo2Div,
@@ -41,9 +45,10 @@ inline constexpr int kNumParams = (int) P::count;
 inline constexpr int idx (P p) noexcept { return (int) p; }
 inline P noteParam (int pc) noexcept  { return (P) (idx (P::noteC) + pc); }
 inline P centsParam (int pc) noexcept { return (P) (idx (P::centsC) + pc); }
+inline P motionStepParam (int i) noexcept { return (P) (idx (P::mStep1) + i); }
 
 enum class Kind { flt, boolean, choice, integer };
-enum class Unit { plain, pct, pctBipolar, db, hz, hzFine, ms, sec, semis, cents, bpm };
+enum class Unit { plain, pct, pctBipolar, db, hz, hzFine, ms, sec, semis, cents, bpm, steps };
 
 struct ParamDef
 {
@@ -66,7 +71,8 @@ int findParam (const juce::String& id);   // -1 if unknown
 
 namespace Choices
 {
-    extern const juce::StringArray notes, scales, ranges, midiModes, characters, gritModes, intervals, divisions, lfoShapes;
+    extern const juce::StringArray notes, scales, ranges, midiModes, characters, gritModes, intervals, divisions, lfoShapes,
+                                   motionStarts;
 }
 
 // Text shown for a value of a parameter (used by the host and the UI).
@@ -82,9 +88,9 @@ struct StageInfo
     const char* blurb;
     P on;
 };
-inline constexpr int kNumStages = 6;
+inline constexpr int kNumStages = 7;
 extern const StageInfo kStages[kNumStages];
-namespace Stage { enum : int { tune = 0, vibrato, harmony1, harmony2, harmony3, doubler }; }
+namespace Stage { enum : int { tune = 0, vibrato, harmony1, harmony2, harmony3, doubler, motion }; }
 
 // Harmony voice h (0..2): its first parameter (On); the others follow in order.
 inline P harmonyParam (int h, int field) noexcept { return (P) (idx (P::h1On) + 5 * h + field); }

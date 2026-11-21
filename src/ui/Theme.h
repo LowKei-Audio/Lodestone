@@ -32,16 +32,18 @@ namespace lodestone::theme
     // Section accents (same order as kStages: Correction .. Double).
     inline juce::Colour stage (int s)
     {
-        static const juce::Colour c[6] = {
+        static const juce::Colour c[7] = {
             juce::Colour (0xfff5c04a),   // Correction - gold
             juce::Colour (0xffff9d5c),   // Vibrato    - copper
             juce::Colour (0xff6ff0c4),   // Harmony 1  - mint
             juce::Colour (0xff6fb7ff),   // Harmony 2  - field blue
             juce::Colour (0xffb790ff),   // Harmony 3  - violet
             juce::Colour (0xffff86bd),   // Double     - rose
+            juce::Colour (0xffb8f05a),   // Motion     - lime
         };
-        return c[juce::jlimit (0, 5, s)];
+        return c[juce::jlimit (0, 6, s)];
     }
+    inline const juce::Colour beat { 0xff5ad8f0 };   // Chord Lock: the beat (cyan)
     inline const juce::Colour global { 0xffe6ecf1 };
     inline const juce::Colour mod    { 0xfff5c04a };
 

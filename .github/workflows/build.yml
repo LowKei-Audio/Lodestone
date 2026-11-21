@@ -8,12 +8,14 @@
 #   4. Static and clicks: preset changes, Dice, A/B, undo and host loads while
 #      singing; loop wraps and transport restarts with synced LFOs; held notes;
 #      every knob jumped and every switch flipped
+#   4b. The beat (v2): sidechain bus layouts, Chord Lock end to end, LEARN from
+#      the beat, Motion on the host grid, 1.x projects loading unchanged
 #   5. pluginval at strictness 10 (host-compatibility torture test)
 #   6. Steinberg's official VST3 validator
 #   7. clap-validator, the official CLAP conformance suite
 # Each check also posts its headline result as an annotation on the run page.
 # After the checks, it builds the Inno Setup installer. Publishing a release:
-#   - push a version tag (v1.0.1), or
+#   - push a version tag (v2.0.0), or
 #   - push to the `release` branch: the run creates the v<version> tag from
 #     CMakeLists.txt itself and publishes the GitHub Release (it refuses a
 #     version that has already been released).
@@ -83,7 +85,7 @@ jobs:
       - name: DSP tests
         run: |
           ./build/Release/lodestone_tests.exe | tee tests.log
-          echo "::notice title=DSP tests::$(grep -E 'All tests passed|test cases' tests.log | tail -1) | $(grep -E 'of one core' tests.log | sed 's/^ *//')"
+          echo "::notice title=DSP tests::$(grep -E 'All tests passed|test cases' tests.log | tail -1) | $(grep -E 'of one core' tests.log | sed 's/^ *//' | paste -sd ';' -)"
 
       - name: Patch and state checks
         run: |
@@ -100,6 +102,11 @@ jobs:
           ./build/lodestone_check_artefacts/Release/lodestone_check.exe static | tee static.log
           echo "::notice title=Static and clicks::$(grep 'worst event' static.log) | $(tail -1 static.log)"
 
+      - name: Beat check (sidechain, Chord Lock, Motion)
+        run: |
+          ./build/lodestone_check_artefacts/Release/lodestone_check.exe beat | tee beat.log
+          echo "::notice title=Beat (Chord Lock, Motion)::$(tail -1 beat.log)"
+
       - name: UI snapshots (Windows font rendering)
         run: |
           mkdir -p screenshots
@@ -109,6 +116,7 @@ jobs:
           $C snapshot screenshots/tune-1200.png 1200 tune 21
           $C snapshot screenshots/voice-1200.png 1200 voice 33
           $C snapshot screenshots/harmony-1200.png 1200 harmony 23
+          $C snapshot screenshots/beat-1200.png 1200 beat 52
           $C snapshot screenshots/mod-1200.png 1200 mod 1
           $C snapshot screenshots/global-1200.png 1200 global 1
           $C snapshot screenshots/easy-840.png 840 easy 0

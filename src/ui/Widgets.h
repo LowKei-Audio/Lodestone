@@ -372,8 +372,8 @@ public:
         button.setMouseCursor (juce::MouseCursor::PointingHandCursor);
         button.setClickingTogglesState (false);
         button.setColour (juce::TextButton::buttonOnColourId, theme::gold);
-        button.setTooltip ("LEARN: play the song (or sing over it) and Lodestone finds the key. Click again to set it now; "
-                           "it also sets itself once it is sure.");
+        button.setTooltip ("LEARN: play the song (or sing over it) and Lodestone finds the key. With the beat on the sidechain "
+                           "it listens to the beat instead (faster and surer). Click again to set it now; it also sets itself once it is sure.");
         button.onClick = [this] { clicked(); };
         status = "Finds the key by listening";
     }
@@ -391,7 +391,8 @@ public:
         else
         {
             const auto k = dsp::findKey (hist);
-            s = "Hearing " + juce::String (dsp::noteName (k.key)) + (k.minor ? " minor" : " major") + "  "
+            s = juce::String (proc.keyFromBeat() ? "Hearing the beat: " : "Hearing ")
+                + juce::String (dsp::noteName (k.key)) + (k.minor ? " minor" : " major") + "  "
                 + juce::String (juce::roundToInt (k.confidence * 100.0f)) + "%";
             if (total >= 15.0f && k.confidence >= 0.35f) { finish (true); return; }
         }

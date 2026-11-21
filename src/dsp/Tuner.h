@@ -15,6 +15,10 @@
 //   Create   an added vibrato with rate, depth, delay, onset and variation.
 //   Snap     (performance) instant hard tune while held.
 //   Hold     (performance) freezes the target note: the voice is pinned to it.
+//   Chord    (v2) Chord Lock: the chord heard on the sidechain pulls notes onto
+//            its tones (see chordPull in Scales.h).
+//   Motion   (v2) a step of the Motion pattern moves the target that many
+//            notes up or down the scale (or the chord), with its own glide.
 //
 // Output: the pitch shift (semitones) to apply to the audio at this moment.
 
@@ -49,6 +53,13 @@ struct TunerParams
 
     bool snap = false;
     bool hold = false;
+
+    Mask chord = 0;               // chord tones heard on the sidechain (0 = none)
+    float chordLock = 0.0f;       // 0..1
+
+    bool motionOn = false;
+    int motionStep = 0;           // notes up (+) or down (-) for the current step
+    float motionGlideMs = 12.0f;
 };
 
 struct TunerState
@@ -62,6 +73,7 @@ struct TunerState
     float outputPitch = 0.0f;     // inputPitch + shift
     float flexWeight = 1.0f;      // how much correction Flex allows now (0..1)
     float noteAge = 0.0f;         // seconds on the current target
+    int motionNote = 60;          // target moved by the Motion step (= targetNote when off)
 };
 
 class Tuner
@@ -81,6 +93,7 @@ public:
         vibPhase = 0.0f;
         vibDrift = 0.0f;
         heldNote = -1;
+        motionS = 0.0f;
     }
 
     // dt = seconds in this control block. pitch = detected MIDI float.
@@ -95,7 +108,7 @@ public:
             silentTime += dt;
             // Hold the last shift through short gaps (consonants); relax after.
             if (silentTime > 0.25f) { corr *= std::exp (-dt / 0.05f); corrVel = 0.0f; }
-            st.shift = corr + p.transpose + p.detuneCents * 0.01f;
+            st.shift = corr + motionS + p.transpose + p.detuneCents * 0.01f;
             return st;
         }
 
@@ -109,7 +122,8 @@ public:
         hasCentre = true;
         st.centrePitch = centre;
 
-        // ---- Target note.
+        // ---- Target note (Chord Lock widens or narrows the allowed notes).
+        const Pull pull = chordPull (allowed, p.chord, p.chordLock);
         int target = st.targetNote;
         if (p.hold && heldNote >= 0)
             target = heldNote;
@@ -119,17 +133,27 @@ public:
         {
             // Near the current note, decide on the vibrato-free centre (vibrato
             // never flips notes); a real jump is followed on the raw pitch at once.
-            const float decide = std::abs (pitch - (float) st.targetNote) > 0.8f ? pitch : centre;
+            const float away = std::abs (pitch - (float) st.targetNote);
+            const bool jump = away > 0.8f;
+            const float decide = jump ? pitch : centre;
             const float hyst = lerp (0.05f, 0.45f, p.stability);
-            const int cand = newPhrase ? nearestAllowed (pitch, allowed) : stickyNearest (decide, allowed, st.targetNote, hyst);
+            const int cand = newPhrase ? nearestPreferred (pitch, pull) : stickyPreferred (decide, pull, st.targetNote, hyst);
             if (newPhrase || cand == st.targetNote) { target = cand; candidate = -1; }
             else
             {
-                // A different note must persist (Stability x 45 ms) before we move.
+                // A different note must persist before we move: Stability x 45 ms
+                // near the current note (vibrato and scoops live there), but only
+                // Stability x 8 ms for a leap wider than any vibrato (v2: the voice
+                // used to be held on the old note for the whole wait).
                 if (cand != candidate) { candidate = cand; candidateTime = 0.0f; }
                 candidateTime += dt;
-                if (candidateTime >= p.stability * 0.045f) { target = cand; candidate = -1; }
+                const float wait = p.stability * (away > kLeap ? 0.008f : 0.045f);
+                if (candidateTime >= wait) { target = cand; candidate = -1; }
             }
+            // v2: a leap re-anchors the vibrato-free centre on the new note. It
+            // used to sweep slowly across the notes in between, which could pick
+            // a wrong neighbour note for a moment and held Flex back.
+            if (target != st.targetNote && jump) centre = pitch;
         }
         if (! p.hold) heldNote = target;
         if (target != st.targetNote) st.noteAge = 0.0f;
@@ -201,7 +225,17 @@ public:
             vib = onset * p.vibDepth * (1.0f + 0.35f * var * vibDrift) * std::sin (kTwoPi * vibPhase);
         }
 
-        st.shift = corr + vib + p.transpose + 0.01f * p.detuneCents;
+        // ---- Motion: the pattern's step moves the note through the allowed notes.
+        int mNote = target;
+        if (p.motionOn && p.motionStep != 0)
+            mNote = scaleStep (target, std::clamp (p.motionStep, -24, 24), pull.allowed == 0 ? kAllNotes : pull.allowed);
+        const int mpc = ((mNote % 12) + 12) % 12;
+        const float mWant = p.motionOn ? (float) (mNote - target) + 0.01f * (p.noteCents[(size_t) mpc] - p.noteCents[(size_t) pc]) : 0.0f;
+        motionS = p.motionGlideMs < 0.3f ? mWant : mWant + (motionS - mWant) * std::exp (-dt / (0.001f * p.motionGlideMs));
+        if (std::abs (motionS - mWant) < 1.0e-4f) motionS = mWant;
+        st.motionNote = mNote;
+
+        st.shift = corr + motionS + vib + p.transpose + 0.01f * p.detuneCents;
         st.outputPitch = pitch + st.shift;
         return st;
     }
@@ -215,6 +249,8 @@ public:
     }
 
 private:
+    static constexpr float kLeap = 1.5f;   // semitones: wider than a sung vibrato swings
+
     double fs = 48000.0;
     TunerState st;
     float corr = 0.0f, corrVel = 0.0f, centre = 0.0f;
@@ -222,6 +258,7 @@ private:
     int candidate = -1, heldNote = -1;
     float candidateTime = 0.0f, silentTime = 1.0f;
     float vibPhase = 0.0f, vibDrift = 0.0f, vibDriftTarget = 0.0f, vibDriftTimer = 0.0f;
+    float motionS = 0.0f;   // Motion offset (semitones), glided
     std::uint32_t vibCounter = 0;
 };
 

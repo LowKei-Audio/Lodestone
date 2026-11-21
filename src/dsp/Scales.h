@@ -83,6 +83,62 @@ inline int stickyNearest (float pitch, Mask m, int current, float hysteresis) no
     return dCur - dCand > hysteresis ? cand : current;
 }
 
+// ---------------------------------------------------------------------------
+// Chord Lock (v2). The notes a voice may land on, and how much the chord's own
+// tones are preferred:
+//   lock 0        the scale as set (bit for bit the 1.x behaviour)
+//   0 < lock < 1  scale plus chord tones; a chord tone counts as 2 x lock
+//                 semitones closer (50%: a note a semitone off a chord tone
+//                 goes to it)
+//   lock 1        chord tones only
+struct Pull
+{
+    Mask allowed = kAllNotes;
+    Mask preferred = 0;
+    float bias = 0.0f;   // semitones
+};
+
+inline Pull chordPull (Mask scale, Mask chord, float lock) noexcept
+{
+    Pull p;
+    p.allowed = scale;
+    if ((chord & kAllNotes) == 0 || lock <= 0.0f) return p;
+    if (lock >= 0.999f) { p.allowed = chord & kAllNotes; return p; }
+    p.allowed = (Mask) ((scale | chord) & kAllNotes);
+    p.preferred = chord & kAllNotes;
+    p.bias = 2.0f * lock;
+    return p;
+}
+
+// Nearest allowed note, preferred notes counting `bias` semitones closer.
+inline int nearestPreferred (float pitch, const Pull& p) noexcept
+{
+    if (p.preferred == 0 || p.bias <= 0.0f) return nearestAllowed (pitch, p.allowed);
+    Mask m = (p.allowed & kAllNotes) == 0 ? kAllNotes : p.allowed;
+    const int base = (int) std::lround (pitch);
+    int best = base;
+    float bestD = 1.0e9f;
+    for (int d = -12; d <= 12; ++d)
+    {
+        const int n = base + d;
+        if (! has (m, n)) continue;
+        const float dist = std::abs ((float) n - pitch) - (has (p.preferred, n) ? p.bias : 0.0f);
+        if (dist < bestD) { bestD = dist; best = n; }
+    }
+    return best;
+}
+
+// stickyNearest with chord preference (same rule: the new note must win by `hysteresis`).
+inline int stickyPreferred (float pitch, const Pull& p, int current, float hysteresis) noexcept
+{
+    if (p.preferred == 0 || p.bias <= 0.0f) return stickyNearest (pitch, p.allowed, current, hysteresis);
+    const Mask m = (p.allowed & kAllNotes) == 0 ? kAllNotes : p.allowed;
+    const int cand = nearestPreferred (pitch, p);
+    if (cand == current || ! has (m, current)) return cand;
+    auto cost = [&] (int n) { return std::abs (pitch - (float) n) - (has (p.preferred, n) ? p.bias : 0.0f); };
+    return cost (current) - cost (cand) > hysteresis ? cand : current;
+}
+
 // Moves `steps` notes up (positive) or down through the allowed set.
 inline int scaleStep (int note, int steps, Mask m) noexcept
 {
@@ -122,6 +178,23 @@ inline int harmonyNote (int leadNote, int intervalIndex, Mask m) noexcept
     if (intervalIndex == Ivl::octThird)  return scaleStep (leadNote, 2, m) + 12;
     if (intervalIndex == Ivl::octFifth)  return scaleStep (leadNote, 4, m) + 12;
     return scaleStep (leadNote, iv.value, m);
+}
+
+// The harmony note when the harmonies follow the chord (Chord Lock 50% and up):
+// scale-step intervals step through the chord's tones instead, two scale steps
+// to one chord step ("3rd Up" = the next chord tone up, "5th Up" = the one
+// after), so every harmony is a note of the chord the beat is playing.
+inline int chordHarmonyNote (int leadNote, int intervalIndex, Mask chord) noexcept
+{
+    if (intervalIndex < 0 || intervalIndex >= kNumIntervals) return leadNote;
+    const auto& iv = kIntervals[intervalIndex];
+    if (! iv.scaleSteps) return leadNote + iv.value;
+    if ((chord & kAllNotes) == 0) return harmonyNote (leadNote, intervalIndex, kAllNotes);
+    auto chordSteps = [] (int scaleSteps) { return scaleSteps > 0 ? (scaleSteps + 1) / 2 : -((-scaleSteps + 1) / 2); };
+    if (intervalIndex == Ivl::sixthDown) return scaleStep (leadNote, 1, chord) - 12;
+    if (intervalIndex == Ivl::octThird)  return scaleStep (leadNote, 1, chord) + 12;
+    if (intervalIndex == Ivl::octFifth)  return scaleStep (leadNote, 2, chord) + 12;
+    return scaleStep (leadNote, chordSteps (iv.value), chord);
 }
 
 // ---------------------------------------------------------------------------

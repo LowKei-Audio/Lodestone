@@ -579,3 +579,369 @@ TEST_CASE ("Static: a sound change fades to dry, holds, then fades back smoothly
     CHECK_THAT (wl[n - 1], WithinAbs (0.5f, 1e-4));                      // the new sound fully in
     CHECK (out.getTransition() == 0.0f);
 }
+
+// ===========================================================================
+// Lodestone 2.0
+// ===========================================================================
+
+// A beat for the chord analyzer: pad chord (7 harmonics per note, middle C
+// octave), a bass note two octaves down and, optionally, kick and hats.
+static std::vector<float> beat (const std::vector<std::pair<int, int>>& chords, double secondsEach, double fs = kFs,
+                                bool drums = true)
+{
+    const size_t n = (size_t) ((double) chords.size() * secondsEach * fs);
+    std::vector<float> x (n);
+    std::uint32_t noise = 12345u;
+    double ph[5] {};
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double t = (double) i / fs;
+        const auto [root, shape] = chords[(size_t) (t / secondsEach)];
+        const auto& sh = kChordShapes[shape];
+        double s = 0.0;
+        for (int k = 0; k < sh.count; ++k)
+        {
+            ph[k] += midiToHz (60 + (root + sh.tones[(size_t) k]) % 12) / fs;
+            ph[k] -= std::floor (ph[k]);
+            for (int h = 1; h < 8; ++h) s += 0.15 / h * std::sin (2.0 * kPiD * h * ph[k]);
+        }
+        ph[4] += midiToHz (36 + root) / fs;
+        ph[4] -= std::floor (ph[4]);
+        s += 0.5 * std::sin (2.0 * kPiD * ph[4]) + 0.15 * std::sin (4.0 * kPiD * ph[4]);
+        if (drums)
+        {
+            const double bt = std::fmod (t, 0.5), ht = std::fmod (t, 0.25);
+            noise = noise * 1664525u + 1013904223u;
+            s += 0.8 * std::exp (-bt * 30.0) * std::sin (2.0 * kPiD * 55.0 * bt * (1.0 + 2.0 * std::exp (-bt * 40.0)));
+            s += 0.15 * std::exp (-ht * 80.0) * ((double) (noise >> 8) / 8388608.0 - 1.0);
+        }
+        x[i] = (float) (0.25 * s);
+    }
+    return x;
+}
+
+static std::vector<float> drumsOnly (double seconds, double fs = kFs)
+{
+    std::vector<float> x ((size_t) (seconds * fs));
+    std::uint32_t noise = 777u;
+    for (size_t i = 0; i < x.size(); ++i)
+    {
+        const double t = (double) i / fs, bt = std::fmod (t, 0.5), ht = std::fmod (t, 0.25);
+        noise = noise * 1664525u + 1013904223u;
+        const double r = (double) (noise >> 8) / 8388608.0 - 1.0;
+        x[i] = (float) (0.2 * (0.8 * std::exp (-bt * 30.0) * std::sin (2.0 * kPiD * 55.0 * bt * (1.0 + 2.0 * std::exp (-bt * 40.0)))
+                               + 0.15 * std::exp (-ht * 80.0) * r + 0.02 * r));
+    }
+    return x;
+}
+
+TEST_CASE ("v2 Tuner: legato leaps land fast and never visit a wrong note")
+{
+    // 1.x held the voice on the old note through the whole Stability wait,
+    // then the slow vibrato-free centre swept across the notes in between and
+    // could pick a wrong one for ~20 ms (e.g. 64 on a 60 -> 65 leap).
+    for (const bool live : { false, true })
+        for (const double leap : { 2.0, 5.0, 7.0, -5.0, 12.0 })
+        {
+            VoiceEngine e;
+            auto p = hardTune();
+            p.tuner.flex = 0.15f;
+            e.setLowLatency (live);
+            makeEngine (e, p, live);
+            const auto in = voice ([leap] (double t) { return (t < 0.6 ? 60.0 : 60.0 + leap) + 0.4; }, 1.0);
+            std::vector<float> l (32), r (32), d (32);
+            const int lat = e.getLatency(), newNote = (int) std::lround (60.0 + leap);
+            double landed = -1.0;
+            int wrong = 0;
+            for (size_t pos = 0; pos + 32 <= in.size(); pos += 32)
+            {
+                e.process (&in[pos], l.data(), r.data(), d.data(), 32);
+                const double t = (double) ((std::int64_t) pos - lat) / kFs - 0.6;
+                const auto& v = e.getView();
+                if (t < 0.0 || t > 0.3 || ! v.voiced) continue;
+                if (v.targetNote != 60 && v.targetNote != newNote) ++wrong;
+                if (landed < 0.0 && v.targetNote == newNote && std::abs (v.outputPitch - (float) newNote) < 0.1f) landed = t;
+            }
+            INFO ((live ? "Live" : "Studio") << " leap " << leap << ": on the new note after " << landed * 1000.0 << " ms");
+            REQUIRE (wrong == 0);
+            REQUIRE (landed >= 0.0);
+            // Instrument range (the widest analysis window). 1.x: 35-122 ms with
+            // wrong notes on every leap, and octave leaps never landed.
+            REQUIRE (landed < (live ? 0.045 : 0.032));
+        }
+}
+
+TEST_CASE ("v2 Chord analyzer: names chords at every sample rate, ignores drums")
+{
+    const std::vector<std::pair<int, int>> prog = { { 9, 1 }, { 5, 0 }, { 0, 0 }, { 7, 0 }, { 2, 3 }, { 0, 4 }, { 11, 5 }, { 2, 6 }, { 4, 0 } };
+    for (const double fs : { 44100.0, 48000.0, 96000.0 })
+    {
+        const auto x = beat (prog, 2.0, fs);
+        ChordAnalyzer a;
+        a.prepare (fs);
+        int right = 0;
+        double slowest = 0.0;
+        for (size_t c = 0; c < prog.size(); ++c)
+        {
+            double named = -1.0;
+            const size_t from = (size_t) ((double) c * 2.0 * fs), to = (size_t) ((double) (c + 1) * 2.0 * fs);
+            for (size_t i = from; i < to; ++i)
+            {
+                a.push (x[i]);
+                if (named < 0.0 && a.chord().root == prog[c].first && a.chord().shape == prog[c].second) named = (double) (i - from) / fs;
+            }
+            if (a.chord().root == prog[c].first && a.chord().shape == prog[c].second) ++right;
+            if (c > 0) slowest = std::max (slowest, named < 0.0 ? 9.0 : named);
+        }
+        INFO ("fs " << fs << ": " << right << "/" << prog.size() << " chords, slowest " << slowest * 1000.0 << " ms");
+        REQUIRE (right == (int) prog.size());
+        REQUIRE (slowest < 0.35);
+    }
+
+    SECTION ("drums and noise alone never name a chord")
+    {
+        ChordAnalyzer a;
+        a.prepare (kFs);
+        for (float v : drumsOnly (4.0)) a.push (v);
+        REQUIRE_FALSE (a.chord().valid());
+        REQUIRE (a.hearing());
+    }
+    SECTION ("the chord is kept through drum-only bars and silence")
+    {
+        ChordAnalyzer a;
+        a.prepare (kFs);
+        for (float v : beat ({ { 9, 1 } }, 2.0)) a.push (v);
+        for (float v : drumsOnly (3.0)) a.push (v);
+        REQUIRE (a.chord().root == 9);
+        REQUIRE (a.chord().shape == 1);
+        for (int i = 0; i < (int) (2.0 * kFs); ++i) a.push (0.0f);
+        REQUIRE (a.chord().root == 9);
+        REQUIRE_FALSE (a.hearing());
+    }
+    SECTION ("key evidence for LEARN: A minor from an Am - Dm - E - Am progression")
+    {
+        ChordAnalyzer a;
+        a.prepare (kFs);
+        for (float v : beat ({ { 9, 1 }, { 2, 1 }, { 4, 0 }, { 9, 1 } }, 1.5)) a.push (v);
+        const auto k = findKey (a.getKeyChroma());
+        REQUIRE (k.key == 9);
+        REQUIRE (k.minor);
+    }
+    SECTION ("CPU: well under 1% of one core")
+    {
+        const auto x = beat (prog, 2.0);
+        ChordAnalyzer a;
+        a.prepare (kFs);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (float v : x) a.push (v);
+        const double secs = std::chrono::duration<double> (std::chrono::steady_clock::now() - t0).count();
+        const double pct = 100.0 * secs / ((double) x.size() / kFs);
+        std::printf ("  CPU: chord analyzer at 48 kHz = %.2f%% of one core\n", pct);
+        REQUIRE (pct < 1.0);
+    }
+}
+
+TEST_CASE ("v2 Chord Lock: which note a voice lands on")
+{
+    const Mask cMaj = scaleMask (0, Scale::major), cChord = chordMask (0, 0), d7 = chordMask (2, 2);
+    SECTION ("0% is exactly the scale")
+    {
+        const auto p = chordPull (cMaj, cChord, 0.0f);
+        for (float x = 55.0f; x < 72.0f; x += 0.07f) REQUIRE (nearestPreferred (x, p) == nearestAllowed (x, cMaj));
+    }
+    SECTION ("100%: chord tones only, the nearest one")
+    {
+        const auto p = chordPull (cMaj, cChord, 1.0f);
+        REQUIRE (nearestPreferred (65.2f, p) == 64);   // F -> E
+        REQUIRE (nearestPreferred (62.2f, p) == 64);   // D (a little sharp) -> E
+        REQUIRE (nearestPreferred (69.0f, p) == 67);   // A -> G
+    }
+    SECTION ("50%: a note a semitone off a chord tone moves to it; others stay")
+    {
+        const auto p = chordPull (cMaj, cChord, 0.55f);
+        REQUIRE (nearestPreferred (65.0f, p) == 64);   // F, a semitone above E
+        REQUIRE (nearestPreferred (62.0f, p) == 62);   // D, two semitones from C and E: stays
+        REQUIRE (nearestPreferred (69.0f, p) == 69);   // A stays
+    }
+    SECTION ("chord tones outside the scale become reachable (secondary dominant)")
+    {
+        const auto p = chordPull (cMaj, d7, 0.6f);   // D7 has F#
+        REQUIRE (nearestPreferred (66.1f, p) == 66);
+        REQUIRE (nearestPreferred (66.1f, chordPull (cMaj, d7, 0.0f)) != 66);
+    }
+    SECTION ("chord harmonies: the next chord tones")
+    {
+        const Mask f = chordMask (5, 0);                       // F A C
+        REQUIRE (chordHarmonyNote (60, Ivl::thirdUp, f) == 65);   // C -> F
+        REQUIRE (chordHarmonyNote (60, Ivl::fifthUp, f) == 69);   // C -> A
+        REQUIRE (chordHarmonyNote (60, Ivl::thirdDown, f) == 57); // C -> A below
+        REQUIRE (chordHarmonyNote (60, Ivl::octUp, f) == 72);     // fixed intervals stay fixed
+        REQUIRE (chordHarmonyNote (60, Ivl::octThird, f) == 77);  // F an octave up
+    }
+}
+
+TEST_CASE ("v2 Engine: harmonies stack on the chord's tones (Chord Lock 50%+)")
+{
+    auto p = hardTune (Scale::major);
+    p.tuner.retuneMs = 5.0f;
+    p.leadLevel = 0.0f;
+    p.harmony[0].on = true;
+    p.harmony[0].interval = Ivl::thirdUp;
+    p.harmony[0].level = 1.0f;
+    p.harmonyHumanize = 0.0f;
+    const auto in = steady (60.1, 1.2);   // C4
+
+    VoiceEngine scale;
+    makeEngine (scale, p);
+    scale.setChord (chordMask (5, 0));      // F major heard, but Chord Lock 0
+    const auto a = run (scale, in);
+    REQUIRE (std::abs (measurePitch (a.l, (size_t) (0.5 * kFs), a.l.size()) - 64.0) < 0.05);   // E: the scale's 3rd
+
+    p.chordLock = 0.6f;
+    VoiceEngine chord;
+    makeEngine (chord, p);
+    chord.setChord (chordMask (5, 0));
+    const auto b = run (chord, in);
+    REQUIRE (std::abs (measurePitch (b.l, (size_t) (0.5 * kFs), b.l.size()) - 65.0) < 0.05);   // F: the chord's next tone
+}
+
+TEST_CASE ("v2 Engine: Motion steps through the scale, restarts with each phrase")
+{
+    auto p = hardTune (Scale::major);
+    p.motionOn = true;
+    p.motionStart = MotionStart::phrase;
+    p.motionDivision = Div::d4;           // quarter notes at 120 bpm: 0.5 s per step
+    p.motionLength = 2;
+    p.motionSteps[0] = 0;
+    p.motionSteps[1] = 4;                 // C -> G (four notes up C major)
+    p.motionGlideMs = 0.0f;
+
+    // Two phrases with a pause: each starts on step 1 (the sung note).
+    auto in = voice ([] (double) { return 60.1; }, 2.6);
+    for (size_t i = (size_t) (1.0 * kFs); i < (size_t) (1.6 * kFs); ++i) in[i] = 0.0f;
+    VoiceEngine e;
+    makeEngine (e, p);
+    e.setTransport (0.0, 120.0);
+    std::vector<float> l (32), r (32), d (32), out;
+    for (size_t pos = 0; pos + 32 <= in.size(); pos += 32)
+    {
+        e.setTransport (0.0, 120.0);   // a stopped host: Phrase mode does not need the playhead
+        e.process (&in[pos], l.data(), r.data(), d.data(), 32);
+        out.insert (out.end(), l.begin(), l.end());
+    }
+    auto at = [&] (double a, double b) { return measurePitch (out, (size_t) (a * kFs), (size_t) (b * kFs)); };
+    const double lat = e.getLatency() / kFs;
+    INFO ("phrase 1: " << at (0.15 + lat, 0.45 + lat) << " then " << at (0.62 + lat, 0.95 + lat)
+          << "; phrase 2: " << at (1.68 + lat, 2.05 + lat) << " then " << at (2.15 + lat, 2.5 + lat));
+    REQUIRE (std::abs (at (0.15 + lat, 0.45 + lat) - 60.0) < 0.06);
+    REQUIRE (std::abs (at (0.62 + lat, 0.95 + lat) - 67.0) < 0.06);
+    REQUIRE (std::abs (at (1.68 + lat, 2.05 + lat) - 60.0) < 0.06);   // restarted on step 1
+    REQUIRE (std::abs (at (2.15 + lat, 2.50 + lat) - 67.0) < 0.06);
+}
+
+TEST_CASE ("v2 Engine: Motion off and Chord Lock 0 leave the output untouched by v2")
+{
+    // The same engine settings with and without a chord heard and a Motion
+    // pattern loaded (but off) render sample for sample the same.
+    auto p = hardTune (Scale::major);
+    p.tuner.retuneMs = 20.0f;
+    p.harmony[0].on = true;
+    const auto in = voice ([] (double t) { return 62.3 + 0.3 * std::sin (2.0 * kPiD * 5.0 * t) + (t > 0.7 ? 3.0 : 0.0); }, 1.5);
+    VoiceEngine a, b;
+    makeEngine (a, p);
+    auto q = p;
+    q.motionSteps = { 3, -2, 5, 1 };
+    q.motionOn = false;
+    q.chordLock = 0.0f;
+    makeEngine (b, q);
+    b.setChord (chordMask (9, 1));
+    const auto oa = run (a, in), ob = run (b, in);
+    REQUIRE (oa.l == ob.l);
+    REQUIRE (oa.r == ob.r);
+}
+
+TEST_CASE ("v2 Detector: octave leaps are followed in every input range; weak fundamentals hold")
+{
+    // 1.x kept following the old octave after a legato octave leap (up, and
+    // in the Bass range down too) for as long as the note lasted.
+    struct R { int range; double lo, hi; };
+    const R ranges[] = { { 0, 55, 78 }, { 1, 45, 74 }, { 2, 38, 62 }, { 3, 33, 80 }, { 4, 26, 52 } };
+    auto wrongAfterLeap = [] (int range, double from, double to, bool vib)
+    {
+        const auto in = voice ([&] (double t) { return (t < 0.5 ? from : to) + (vib ? 0.3 * std::sin (2.0 * kPiD * 5.5 * t) : 0.0); }, 1.0);
+        PitchDetector d;
+        d.prepare (kFs);
+        d.setRange (range);
+        int wrong = 0;
+        for (float x : in)
+            if (d.push (x) && d.reading().voiced && (double) d.reading().centre / kFs > 0.62
+                && std::abs (hzToMidi (d.reading().hz) - to) > 2.0) ++wrong;
+        return wrong;
+    };
+    for (const auto& r : ranges)
+        for (double a = r.lo; a + 12.0 <= r.hi; a += 5.0)
+            for (const bool vib : { false, true })
+            {
+                INFO ("range " << r.range << (vib ? " with vibrato " : " ") << a << " <-> " << a + 12.0);
+                REQUIRE (wrongAfterLeap (r.range, a, a + 12.0, vib) == 0);
+                REQUIRE (wrongAfterLeap (r.range, a + 12.0, a, vib) == 0);
+            }
+
+    // A voice whose 2nd harmonic is ten times its fundamental keeps its octave.
+    for (const auto& r : ranges)
+        for (double m = r.lo; m <= r.hi; m += 4.0)
+        {
+            std::vector<float> x ((size_t) kFs);
+            double ph = 0.0;
+            for (auto& v : x)
+            {
+                ph += midiToHz (m) / kFs;
+                ph -= std::floor (ph);
+                v = (float) (0.2 * (0.1 * std::sin (2.0 * kPiD * ph) + std::sin (4.0 * kPiD * ph) + 0.6 * std::sin (6.0 * kPiD * ph)
+                                    + 0.3 * std::sin (8.0 * kPiD * ph)));
+            }
+            PitchDetector d;
+            d.prepare (kFs);
+            d.setRange (r.range);
+            int wrong = 0;
+            for (float v : x) if (d.push (v) && d.reading().voiced && std::abs (hzToMidi (d.reading().hz) - m) > 2.0) ++wrong;
+            INFO ("weak fundamental, range " << r.range << ", note " << m);
+            REQUIRE (wrong == 0);
+        }
+}
+
+TEST_CASE ("v2 Engine: no clicks when a glide crosses zero shift (Motion trills, octave hops)")
+{
+    // The lead snaps its grains back onto the input's own pulses when the shift
+    // is ~0; in 1.x that snap could cut a grain's start off mid-glide: a click.
+    float worst = 0.0f;
+    for (const double sung : { 64.1, 64.3, 63.8 })
+        for (const float glide : { 0.0f, 8.0f, 15.0f, 40.0f })
+            for (const auto& pattern : { std::array<int, 2> { 0, 1 }, std::array<int, 2> { 0, 7 } })
+            {
+                auto p = hardTune (Scale::major);
+                p.tuner.retuneMs = 5.0f;
+                p.tuner.keep = 0.2f;
+                p.motionOn = true;
+                p.motionDivision = Div::d16;
+                p.motionLength = 2;
+                p.motionSteps[0] = pattern[0];
+                p.motionSteps[1] = pattern[1];
+                p.motionGlideMs = glide;
+                VoiceEngine e;
+                makeEngine (e, p);
+                e.setTransport (0.0, 120.0);
+                const auto in = voice ([sung] (double t) { return sung + 0.2 * std::sin (2.0 * kPiD * 5.3 * t); }, 2.0);
+                const auto out = run (e, in);
+                std::vector<float> d;
+                for (size_t k = (size_t) (0.5 * kFs); k < out.l.size(); ++k)
+                    d.push_back (std::abs (out.l[k] - 2.0f * out.l[k - 1] + out.l[k - 2]));
+                auto sorted = d;
+                std::nth_element (sorted.begin(), sorted.begin() + (long) (sorted.size() * 99 / 100), sorted.end());
+                const float ratio = *std::max_element (d.begin(), d.end()) / (sorted[sorted.size() * 99 / 100] + 1.0e-6f);
+                INFO ("sung " << sung << ", glide " << glide << " ms, steps 0/" << pattern[1] << ": peak " << ratio << "x p99");
+                REQUIRE (ratio < 2.0f);
+                worst = std::max (worst, ratio);
+            }
+    std::printf ("  Motion glides: worst sharpness %.2fx the voice's own (limit 2.0x)\n", worst);
+}

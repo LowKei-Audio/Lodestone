@@ -1,11 +1,11 @@
 ; Lodestone Windows installer (Inno Setup 6).
-; Built by CI:  iscc /DAppVersion=1.0.1 /DBuildDir=..\build installer\Lodestone.iss
+; Built by CI:  iscc /DAppVersion=2.0.0 /DBuildDir=..\build installer\Lodestone.iss
 ; Installs the VST3 and CLAP plug-ins to the standard shared folders (every DAW
 ; scans them) and, optionally, the standalone app with a Start menu shortcut.
 ; Matches the rest of the LowKei Audio family.
 
 #ifndef AppVersion
-  #define AppVersion "1.0.1"
+  #define AppVersion "2.0.0"
 #endif
 #ifndef BuildDir
   #define BuildDir "..\build"

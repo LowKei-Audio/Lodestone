@@ -9,6 +9,7 @@
 // copied into lock-free atomics, which are all the audio thread ever reads.
 
 #include "Parameters.h"
+#include "dsp/ChordAnalyzer.h"
 #include "dsp/ModSources.h"
 #include "dsp/OutputStage.h"
 #include "dsp/VoiceEngine.h"
@@ -98,12 +99,23 @@ public:
         return std::max (16, (int) std::lround (sampleRate * (live ? 0.003 : 0.015)));
     }
 
-    // Key learning: the engine counts how long each pitch class is sung.
+    // Key learning: the engine counts how long each pitch class is sung; with a
+    // beat on the sidechain, the beat's own notes are used instead (v2): they are
+    // far more reliable, so they count three times as fast.
     void clearKeyHistogram() noexcept { clearChromaRequested.store (true); }
+    bool keyFromBeat() const noexcept
+    {
+        float beat = 0.0f;
+        for (int i = 0; i < 12; ++i) beat += uiBeatKey[(size_t) i].load (std::memory_order_relaxed);
+        return beat >= 0.5f;
+    }
     std::array<float, 12> getKeyHistogram() const noexcept
     {
         std::array<float, 12> c {};
-        for (int i = 0; i < 12; ++i) c[(size_t) i] = uiChroma[(size_t) i].load (std::memory_order_relaxed);
+        const bool beat = keyFromBeat();
+        for (int i = 0; i < 12; ++i)
+            c[(size_t) i] = beat ? 3.0f * uiBeatKey[(size_t) i].load (std::memory_order_relaxed)
+                                 : uiChroma[(size_t) i].load (std::memory_order_relaxed);
         return c;
     }
     // LEARN is listening (message thread only; shared by every LEARN button).
@@ -126,6 +138,12 @@ public:
     std::array<std::atomic<bool>, kNumStages> uiStageOn {};
     std::array<std::atomic<float>, 12> uiChroma {};
 
+    // The beat (sidechain), v2: the chord heard, whether sound is arriving, the
+    // chord tones in use by Chord Lock, the beat's chroma and the Motion step.
+    std::atomic<int> uiChordRoot { -1 }, uiChordShape { 0 }, uiChordInUse { 0 }, uiMotionStep { -1 };
+    std::atomic<bool> uiBeatHearing { false }, uiSidechainConnected { false };
+    std::array<std::atomic<float>, 12> uiBeatChroma {}, uiBeatKey {};
+
     // Pitch history for the display: one entry every other control block.
     // Unvoiced entries hold -1. histCount only grows; read the last entries.
     static constexpr int kHist = 2048;
@@ -141,6 +159,7 @@ public:
     // For tests / tools: the effective value of a parameter after modulation.
     float effectiveValue (P p) const noexcept { return eff[(size_t) idx (p)]; }
     const dsp::VoiceEngine& getEngine() const noexcept { return engine; }
+    const dsp::ChordAnalyzer& getChordAnalyzer() const noexcept { return chords; }
     float getSoundTransition() const noexcept { return output.getTransition(); }   // 0 = settled
 
 private:
@@ -174,12 +193,13 @@ private:
     std::array<float, kNumSources> srcVal {};
 
     dsp::VoiceEngine engine;
+    dsp::ChordAnalyzer chords;   // listens to the sidechain (the beat)
     dsp::OutputStage output;
     dsp::ModLfo lfos[2];
     dsp::EnvFollower env;
     dsp::Chaos drift;
     dsp::Smoother inGainS;
-    juce::AudioBuffer<float> scratch;   // mono in, dry, wet L/R
+    juce::AudioBuffer<float> scratch;   // mono in, dry, wet L/R, sidechain mono
 
     std::atomic<bool> lowLatencyWanted { false }, clearChromaRequested { false };
     bool lowLatencyActive = false;

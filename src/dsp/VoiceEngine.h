@@ -22,6 +22,7 @@
 #include "PitchDetector.h"
 #include "Tuner.h"
 #include "Module.h"
+#include "ChordAnalyzer.h"
 
 #include <vector>
 
@@ -29,6 +30,8 @@ namespace lodestone::dsp
 {
 
 inline constexpr int kNumHarmonies = 3;
+inline constexpr int kMotionSteps = 16;
+enum class MotionStart { grid = 0, phrase };
 
 struct HarmonyParams
 {
@@ -69,6 +72,15 @@ struct EngineParams
     float doubleDetune = 8.0f;  // cents
     float doubleDelayMs = 18.0f;
 
+    // v2: Chord Lock and Motion.
+    float chordLock = 0.0f;                  // 0..1 (needs a chord from setChord)
+    bool motionOn = false;
+    std::array<int, kMotionSteps> motionSteps {};
+    int motionLength = 8;                    // 1..16 steps
+    int motionDivision = Div::d8;
+    float motionGlideMs = 12.0f;
+    MotionStart motionStart = MotionStart::phrase;
+
     std::uint32_t seed = 1;
 };
 
@@ -80,6 +92,8 @@ struct EngineView
     int targetNote = 60;
     std::array<float, kNumHarmonies> harmonyPitch {};
     std::array<bool, kNumHarmonies> harmonyActive {};
+    int motionStep = -1;                     // step playing (-1: Motion off)
+    Mask chord = 0;                          // chord tones in use (0: none)
 };
 
 class VoiceEngine
@@ -149,6 +163,8 @@ public:
         harmThroatS.fill (0.0f);
         formantPrimed = false;
         snapPending = false;
+        phraseBeats = 0.0;
+        unvoicedTime = 1.0f;
     }
 
     // After a sound change (the output is fully dry at this point, so nothing
@@ -170,6 +186,13 @@ public:
         detector.setRange (p.range);
         detector.setSensitivity (p.sensitivity);
     }
+
+    // The chord heard on the sidechain (0 = none). Called once per control block.
+    void setChord (Mask chordTones) noexcept { chord = chordTones & kAllNotes; }
+
+    // Musical position of the next block's first input sample (quarter notes)
+    // and the tempo, for Motion. Called once per control block.
+    void setTransport (double ppqNow, double bpmNow) noexcept { ppq = ppqNow; bpm = std::max (1.0, bpmNow); }
 
     // Held MIDI notes, lowest first, plus the most recent one (Exact mode).
     void setHeldNotes (const int* notes, int count, int newest) noexcept
@@ -381,7 +404,42 @@ private:
         int exact = -1;
         if (params.midiMode == MidiMode::exact && heldCount > 0) exact = newestNote;
 
-        const auto& ts = tuner.advance (params.tuner, tr.voiced, tr.pitch, allowed, exact, dt, params.seed);
+        // Chord Lock: MIDI notes that set the scale win over the beat.
+        const bool midiScale = params.midiMode == MidiMode::scale && heldCount > 0;
+        const Mask chordNow = midiScale || params.chordLock <= 0.0f ? (Mask) 0 : chord;
+
+        // Motion: which step of the pattern plays at this output moment. Grid
+        // follows the host's bars (lined up with the delayed output); Phrase
+        // starts the pattern at step 1 whenever singing starts after a pause.
+        auto tp = params.tuner;
+        tp.chord = chordNow;
+        tp.chordLock = params.chordLock;
+        tp.motionOn = params.motionOn;
+        tp.motionGlideMs = params.motionGlideMs;
+        tp.motionStep = 0;
+        view.motionStep = -1;
+        {
+            if (tr.voiced) { if (unvoicedTime > 0.12f) phraseBeats = 0.0; unvoicedTime = 0.0f; }
+            else unvoicedTime += dt;
+            const double beatsNow = bpm / 60.0 * (double) dt;
+            const double divBeats = divisionBeats (params.motionDivision);
+            const int len = std::clamp (params.motionLength, 1, kMotionSteps);
+            double pos;
+            if (params.motionStart == MotionStart::grid)
+                pos = (ppq - (double) latency * bpm / (60.0 * fs)) / divBeats;
+            else
+                pos = phraseBeats / divBeats;
+            const auto stepIdx = (int) (((std::int64_t) std::floor (pos) % len + len) % len);
+            if (params.motionOn)
+            {
+                tp.motionStep = params.motionSteps[(size_t) stepIdx];
+                view.motionStep = stepIdx;
+            }
+            phraseBeats += beatsNow;
+            ppq += beatsNow;
+        }
+
+        const auto& ts = tuner.advance (tp, tr.voiced, tr.pitch, allowed, exact, dt, params.seed);
 
         // Pitch-class histogram for key detection.
         if (tr.voiced && tr.clarity > 0.5f)
@@ -426,9 +484,12 @@ private:
         bypassWanted = std::abs (ts.shift) < 0.005f && std::abs (params.formant) < 0.01f && std::abs (leadThroatS) < 1.0e-3f
                     && params.grit < 0.001f && gritS < 1.0e-4f;
 
-        // Harmonies: scale-step (or fixed) intervals from the target note, or
-        // held MIDI notes in Harmony mode.
+        // Harmonies: scale-step (or fixed) intervals from the target note (as
+        // moved by Motion), or held MIDI notes in Harmony mode. From Chord Lock
+        // 50% up they stack on the chord's tones.
         const bool midiHarm = params.midiMode == MidiMode::harmony;
+        const bool chordHarm = chordNow != 0 && params.chordLock >= 0.5f;
+        const Mask harmMask = chordPull (allowed, chordNow, params.chordLock).allowed;
         const float glide = 1.0f - std::exp (-dt / 0.03f);
         for (int h = 0; h < kNumHarmonies; ++h)
         {
@@ -439,10 +500,11 @@ private:
             if (midiHarm)
             {
                 on = h < heldCount;
-                if (on) interval = (float) (held[(size_t) h] - ts.targetNote);
+                if (on) interval = (float) (held[(size_t) h] - ts.motionNote);
             }
             else if (on)
-                interval = (float) (harmonyNote (ts.targetNote, hp.interval, allowed) - ts.targetNote);
+                interval = (float) ((chordHarm ? chordHarmonyNote (ts.motionNote, hp.interval, chordNow)
+                                               : harmonyNote (ts.motionNote, hp.interval, harmMask)) - ts.motionNote);
 
             const float wantGate = on && ts.voiced ? 1.0f : 0.0f;
             harmonyGate[(size_t) h] += (wantGate - harmonyGate[(size_t) h]) * (1.0f - std::exp (-dt / 0.02f));
@@ -499,6 +561,7 @@ private:
         view.shift = ts.shift;
         view.flexWeight = ts.flexWeight;
         view.clarity = tr.clarity;
+        view.chord = chordNow;
     }
 
     float advanceDrift (int i, float dt) noexcept
@@ -543,11 +606,15 @@ private:
             if (! v.lead) shift += shiftAt ((std::int64_t) srcTime);
             const auto* m = pickMark (srcTime);
             const float P = m != nullptr ? m->period : lastVoicedPeriod;
-            // No shift: grains go back exactly where they were cut (phase-locked
-            // to the input), so the lead stays in time with the dry signal.
-            if (v.lead && m != nullptr && std::abs (shift) < 0.02f && std::abs (v.formant - 1.0f) < 1.0e-3f)
-                v.next = (double) m->pos;
             const float hOut = P / std::max (0.25f, v.formant);
+            // No shift: grains go back exactly where they were cut (phase-locked
+            // to the input), so the lead stays in time with the dry signal. Only
+            // when the grain can still be written whole: snapping it to a mark
+            // whose window has already begun cut the grain's start off, a click
+            // whenever a glide crossed zero shift (v2 fix; Motion does it a lot).
+            if (v.lead && m != nullptr && std::abs (shift) < 0.02f && std::abs (v.formant - 1.0f) < 1.0e-3f
+                && (double) m->pos - hOut >= (double) t - 2.0)
+                v.next = (double) m->pos;
             if (v.next - hOut > (double) t) return;
             const float ratio = std::clamp (std::pow (2.0f, shift / 12.0f), 0.25f, 4.0f);
             const float spacing = P / ratio;
@@ -618,6 +685,10 @@ private:
 
     std::array<int, kMaxHeld> held {};
     int heldCount = 0, newestNote = -1;
+
+    Mask chord = 0;
+    double ppq = 0.0, bpm = 120.0, phraseBeats = 0.0;
+    float unvoicedTime = 1.0f;
 
     float voicedEnv = 0.0f, gritPhase = 0.0f, energy = 0.0f, energyCoeff = 0.98f;
     bool lastMarkVoiced = false, bypassWanted = false;

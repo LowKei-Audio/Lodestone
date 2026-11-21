@@ -17,7 +17,8 @@ const Identifier kSrcProp ("src"), kDstProp ("dst"), kAmtProp ("amt");
 LodestoneProcessor::LodestoneProcessor()
     : AudioProcessor (BusesProperties()
                           .withInput  ("Input",  AudioChannelSet::stereo(), true)
-                          .withOutput ("Output", AudioChannelSet::stereo(), true)),
+                          .withOutput ("Output", AudioChannelSet::stereo(), true)
+                          .withInput  ("Sidechain", AudioChannelSet::stereo(), false)),   // v2: the beat, for Chord Lock
       apvts (*this, &undo, "LODESTONE", createParameterLayout())
 {
     for (int i = 0; i < kNumParams; ++i)
@@ -58,7 +59,14 @@ bool LodestoneProcessor::isBusesLayoutSupported (const BusesLayout& layouts) con
     const auto& out = layouts.getMainOutputChannelSet();
     const auto& in = layouts.getMainInputChannelSet();
     if (out != AudioChannelSet::mono() && out != AudioChannelSet::stereo()) return false;
-    return in == AudioChannelSet::mono() || in == AudioChannelSet::stereo();
+    if (in != AudioChannelSet::mono() && in != AudioChannelSet::stereo()) return false;
+    // The sidechain is optional: off, mono or stereo.
+    if (layouts.inputBuses.size() > 1)
+    {
+        const auto& sc = layouts.getChannelSet (true, 1);
+        if (! sc.isDisabled() && sc != AudioChannelSet::mono() && sc != AudioChannelSet::stereo()) return false;
+    }
+    return true;
 }
 
 void LodestoneProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
@@ -70,7 +78,8 @@ void LodestoneProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     output.prepare (sampleRate);
     inGainS.prepare (sampleRate, 20.0f);
     inGainS.snapTo (Decibels::decibelsToGain (raw[(size_t) idx (P::inGain)]->load()));
-    scratch.setSize (4, std::max (samplesPerBlock, kControlBlock));
+    scratch.setSize (5, std::max (samplesPerBlock, kControlBlock));
+    chords.prepare (sampleRate);
     for (auto& l : lfos) l.reset();
     env.reset();
     drift.reset();
@@ -94,6 +103,7 @@ void LodestoneProcessor::reset()
 {
     engine.reset();   // host stop / seek: clear buffers and the pitch track
     output.reset();
+    // The chord analyzer keeps its chord: after a seek the beat is still in the same song.
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +504,13 @@ void LodestoneProcessor::pushEngineParams()
     ep.doubleSpread = v (P::dbSpread);
     ep.doubleDetune = v (P::dbDetune);
     ep.doubleDelayMs = v (P::dbDelay);
+    ep.chordLock = v (P::chordLock);
+    ep.motionOn = b (P::motionOn);
+    for (int k = 0; k < dsp::kMotionSteps; ++k) ep.motionSteps[(size_t) k] = i (motionStepParam (k));
+    ep.motionLength = i (P::motionLength);
+    ep.motionDivision = i (P::motionRate);
+    ep.motionGlideMs = v (P::motionGlide);
+    ep.motionStart = (dsp::MotionStart) i (P::motionStart);
     ep.seed = (std::uint32_t) i (P::seed);
     engine.setParams (ep);
 
@@ -552,8 +569,30 @@ void LodestoneProcessor::handleMidi (const MidiBuffer& midi)
 void LodestoneProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& midi)
 {
     ScopedNoDenormals noDenormals;
-    const int numIn = getTotalNumInputChannels(), numOut = getTotalNumOutputChannels();
+    // Main input channels only: with the sidechain on, the buffer also carries its channels.
+    const int numIn = getMainBusNumInputChannels(), numOut = getMainBusNumOutputChannels();
     const int n = buffer.getNumSamples();
+    if (scratch.getNumSamples() < n) scratch.setSize (5, n, false, false, true);   // host exceeded its block size
+    float* side = scratch.getWritePointer (4);
+
+    // The beat on the sidechain (v2), summed to mono. Read first: its channels
+    // can share the buffer with an output channel that is cleared below (a
+    // mono input with a stereo sidechain). No sidechain: silence, and the last
+    // chord heard is kept.
+    bool hasSidechain = false;
+    if (auto* scBus = getBus (true, 1); scBus != nullptr && scBus->isEnabled() && scBus->getNumberOfChannels() > 0 && n > 0)
+    {
+        auto sc = getBusBuffer (buffer, true, 1);
+        if (sc.getNumChannels() > 0)
+        {
+            hasSidechain = true;
+            const float* s0 = sc.getReadPointer (0);
+            const float* s1 = sc.getNumChannels() > 1 ? sc.getReadPointer (1) : nullptr;
+            for (int k = 0; k < n; ++k) side[k] = s1 != nullptr ? 0.5f * (s0[k] + s1[k]) : s0[k];
+        }
+    }
+    if (! hasSidechain && n > 0) FloatVectorOperations::clear (side, n);
+
     for (int ch = numIn; ch < numOut; ++ch) buffer.clear (ch, 0, n);
     handleMidi (midi);
     if (n == 0 || numOut == 0) return;
@@ -566,7 +605,7 @@ void LodestoneProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& m
         engine.reset();
         output.reset();
     }
-    if (clearChromaRequested.exchange (false)) engine.clearChroma();
+    if (clearChromaRequested.exchange (false)) { engine.clearChroma(); chords.clearKeyChroma(); }
 
     // Tempo and position (for synced LFOs). When the host is stopped (or sends
     // nothing, as in the standalone app) a free-running clock keeps them moving.
@@ -603,7 +642,6 @@ void LodestoneProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& m
         wasPlaying = t.playing;
     }
 
-    if (scratch.getNumSamples() < n) scratch.setSize (4, n, false, false, true);   // host exceeded its block size
     float* mono = scratch.getWritePointer (0);
     float* dryL = scratch.getWritePointer (1);
     float* wetL = scratch.getWritePointer (2);
@@ -621,12 +659,17 @@ void LodestoneProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& m
         mono[k] = x * inGainS.next();
     }
 
+
     for (int start = 0; start < n; start += kControlBlock)
     {
         const int len = std::min (kControlBlock, n - start);
         float pk = 0.0f;
         for (int k = 0; k < len; ++k) pk = std::max (pk, std::abs (mono[start + k]));
         inPeakBlock = std::max (inPeakBlock, pk);
+
+        for (int k = 0; k < len; ++k) chords.push (side[start + k]);
+        engine.setChord (chords.chord().mask());
+        engine.setTransport (t.ppq, t.bpm);
 
         const bool swapped = updateSoundChange();
         runControl (len, pk, t);
@@ -676,6 +719,24 @@ void LodestoneProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& m
     }
     const auto& chroma = engine.getChroma();
     for (int k = 0; k < 12; ++k) uiChroma[(size_t) k].store (chroma[(size_t) k], std::memory_order_relaxed);
+
+    const auto& chord = chords.chord();
+    uiChordRoot.store (chord.root, std::memory_order_relaxed);
+    uiChordShape.store (chord.shape, std::memory_order_relaxed);
+    uiChordInUse.store ((int) vw.chord, std::memory_order_relaxed);
+    // The lit notes on the field and keyboard: what Chord Lock actually allows.
+    uiAllowedMask.store ((int) dsp::chordPull (engine.allowedMask(), vw.chord, eff[(size_t) idx (P::chordLock)]).allowed,
+                         std::memory_order_relaxed);
+    uiMotionStep.store (vw.motionStep, std::memory_order_relaxed);
+    uiBeatHearing.store (chords.hearing(), std::memory_order_relaxed);
+    uiSidechainConnected.store (hasSidechain, std::memory_order_relaxed);
+    const auto& bc = chords.getChroma();
+    const auto& bk = chords.getKeyChroma();
+    for (int k = 0; k < 12; ++k)
+    {
+        uiBeatChroma[(size_t) k].store (bc[(size_t) k], std::memory_order_relaxed);
+        uiBeatKey[(size_t) k].store (bk[(size_t) k], std::memory_order_relaxed);
+    }
 
     uiInPeak.store (inPeakBlock, std::memory_order_relaxed);
     uiOutPeak.store (outPeak, std::memory_order_relaxed);

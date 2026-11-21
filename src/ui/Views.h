@@ -170,16 +170,17 @@ private:
 class ProView : public juce::Component
 {
 public:
-    static constexpr int kPages = 5;
+    static constexpr int kPages = 6;
 
     explicit ProView (LodestoneProcessor& p)
-        : tunePage (p), voicePage (p), harmonyPage (p), modPage (p), globalPage (p), field (p),
+        : tunePage (p), voicePage (p), harmonyPage (p), beatPage (p), modPage (p), globalPage (p), field (p),
           snap (makeSnap (p)), hold (makeHold (p)), macros (p, Knob::Size::medium)
     {
-        const char* names[kPages] = { "TUNE", "VOICE", "HARMONY", "MOD", "GLOBAL" };
+        const char* names[kPages] = { "TUNE", "VOICE", "HARMONY", "BEAT", "MOD", "GLOBAL" };
         const char* tips[kPages] = { "Key, scale, the correction controls, scale notes and micro-tuning",
                                      "Character, throat, grit, breath, transpose and the added vibrato",
                                      "Three harmony voices, the double and their ensemble",
+                                     "Chord Lock (follows the chords of the beat on the sidechain) and Motion (note patterns)",
                                      "LFOs, envelope, drift and the modulation matrix",
                                      "Levels, latency, tempo and seed" };
         for (int i = 0; i < kPages; ++i)
@@ -194,7 +195,7 @@ public:
         field.setCompact (true);
         snap->setCompact (true);
         hold->setCompact (true);
-        for (auto* c : std::initializer_list<juce::Component*> { &tunePage, &voicePage, &harmonyPage, &modPage, &globalPage, &field,
+        for (auto* c : std::initializer_list<juce::Component*> { &tunePage, &voicePage, &harmonyPage, &beatPage, &modPage, &globalPage, &field,
                                                                  snap.get(), hold.get(), &macros })
             addAndMakeVisible (c);
         showPage (0);
@@ -203,7 +204,7 @@ public:
     void showPage (int page)
     {
         current = juce::jlimit (0, kPages - 1, page);
-        juce::Component* pages[kPages] = { &tunePage, &voicePage, &harmonyPage, &modPage, &globalPage };
+        juce::Component* pages[kPages] = { &tunePage, &voicePage, &harmonyPage, &beatPage, &modPage, &globalPage };
         for (int i = 0; i < kPages; ++i)
         {
             pages[i]->setVisible (i == current);
@@ -218,7 +219,8 @@ public:
             case 0: tunePage.tick(); break;
             case 1: voicePage.tick(); break;
             case 2: harmonyPage.tick(); break;
-            case 3: modPage.tick(); break;
+            case 3: beatPage.tick(); break;
+            case 4: modPage.tick(); break;
             default: globalPage.tick(); break;
         }
         field.tick();
@@ -239,9 +241,9 @@ public:
         sidePanel = r.removeFromRight (300);
         r.removeFromRight (10);
         auto tabRow = r.removeFromTop (34);
-        for (auto& t : tabs) t.setBounds (tabRow.removeFromLeft (112).reduced (2, 2));
+        for (auto& t : tabs) t.setBounds (tabRow.removeFromLeft (112).reduced (2, 2));   // 6 x 112 fits the 890 px page
         r.removeFromTop (8);
-        for (auto* pg : std::initializer_list<juce::Component*> { &tunePage, &voicePage, &harmonyPage, &modPage, &globalPage })
+        for (auto* pg : std::initializer_list<juce::Component*> { &tunePage, &voicePage, &harmonyPage, &beatPage, &modPage, &globalPage })
             pg->setBounds (r);
 
         auto s = sidePanel.reduced (12, 12);
@@ -260,6 +262,7 @@ private:
     TunePage tunePage;
     VoicePage voicePage;
     HarmonyPage harmonyPage;
+    BeatPage beatPage;
     ModPage modPage;
     GlobalPage globalPage;
     PitchDisplay field;

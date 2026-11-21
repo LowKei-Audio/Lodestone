@@ -9,6 +9,8 @@
 //              each harmony voice.
 //   Readout    the target note, how far off it was sung and where it landed,
 //              with a tuner needle (full size only).
+//   Chips      SNAP and HOLD when engaged; the chord Chord Lock is using and
+//              the Motion step playing (v2). Chord tones get a cyan lane line.
 
 #include "Controls.h"
 
@@ -46,6 +48,11 @@ public:
         outPitch = proc.uiOutPitch.load();
         flexW = proc.uiFlex.load();
         allowed = proc.uiAllowedMask.load();
+        chordMask = proc.uiChordInUse.load();
+        chordRoot = proc.uiChordRoot.load();
+        chordShape = proc.uiChordShape.load();
+        motionStep = proc.uiMotionStep.load();
+        motionLen = juce::roundToInt (proc.apvts.getRawParameterValue ("motion_length")->load());
         snap = proc.apvts.getRawParameterValue ("snap")->load() > 0.5f;
         hold = proc.apvts.getRawParameterValue ("hold")->load() > 0.5f;
         for (int h = 0; h < dsp::kNumHarmonies; ++h)
@@ -61,7 +68,9 @@ public:
             const float d = targetPitch - centre;
             centre += d * (std::abs (d) > span() * 0.7f ? 0.5f : 0.12f);
         }
-        if (count != lastCount || voiced != lastVoiced) repaint();
+        const int chips = chordMask * 131 + chordRoot * 17 + chordShape * 7 + motionStep * 3 + motionLen;
+        if (count != lastCount || voiced != lastVoiced || chips != lastChips) repaint();
+        lastChips = chips;
         lastCount = count;
         lastVoiced = voiced;
     }
@@ -125,7 +134,9 @@ private:
                 g.setColour (theme::gold.withAlpha (0.045f));
                 g.fillRect (lane);
             }
-            g.setColour (lit ? theme::gold.withAlpha (isTarget ? 0.75f : 0.28f) : juce::Colours::white.withAlpha (0.045f));
+            const bool chordTone = (chordMask >> (((n % 12) + 12) % 12)) & 1;
+            g.setColour (chordTone && ! isTarget ? theme::beat.withAlpha (0.45f)
+                         : lit ? theme::gold.withAlpha (isTarget ? 0.75f : 0.28f) : juce::Colours::white.withAlpha (0.045f));
             g.drawHorizontalLine ((int) std::lround (y), plot.getX(), lane.getRight());
 
             // Gutter labels: every target note, and every C for orientation.
@@ -294,20 +305,39 @@ private:
         auto tag = juce::Rectangle<float> (r.getX() + (compact ? 36.0f : 50.0f), r.getY() + 10.0f, 64.0f, 22.0f);
         auto draw = [&] (const char* text, juce::Colour c)
         {
+            // Width follows the text (chord names such as "C#maj7" are longer than "Snap").
+            juce::GlyphArrangement ga;
+            ga.addLineOfText (theme::font (11.0f, true).withExtraKerningFactor (0.12f), juce::String (text).toUpperCase(), 0.0f, 0.0f);
+            tag.setWidth (juce::jmax (64.0f, ga.getBoundingBox (0, -1, true).getWidth() + 18.0f));
             theme::glow (g, tag.getCentre(), 40.0f, c, 0.35f);
             g.setColour (c);
             g.fillRoundedRectangle (tag, 5.0f);
             theme::legend (g, text, tag, juce::Colour (0xff12090b), 11.0f);
-            tag = tag.translated (72.0f, 0.0f);
+            tag = tag.translated (tag.getWidth() + 8.0f, 0.0f);
         };
         if (snap) draw ("Snap", theme::snap);
         if (hold) draw ("Hold", theme::hold);
+        if (chordMask != 0)
+        {
+            dsp::Chord c;
+            c.root = chordRoot;
+            c.shape = juce::jlimit (0, dsp::kNumChordShapes - 1, chordShape);
+            char name[16];
+            dsp::chordName (c, name, 16);
+            draw (name, theme::beat);
+        }
+        if (motionStep >= 0)
+        {
+            const auto text = juce::String (motionStep + 1) + "/" + juce::String (juce::jmax (1, motionLen));
+            draw (text.toRawUTF8(), theme::stage (Stage::motion));
+        }
     }
 
     LodestoneProcessor& proc;
     bool compact = false, voiced = false, lastVoiced = false, snap = false, hold = false, hasCentre = false;
     std::vector<float> in, out;
     int visible = 1800, lastCount = -1, targetNote = 60, allowed = 0;
+    int chordMask = 0, chordRoot = -1, chordShape = 0, motionStep = -1, motionLen = 8, lastChips = 0;
     float centre = 60.0f, targetPitch = 60.0f, inPitch = 0.0f, outPitch = 0.0f, flexW = 1.0f;
     std::array<float, dsp::kNumHarmonies> harmPitch {};
     std::array<bool, dsp::kNumHarmonies> harmActive {};

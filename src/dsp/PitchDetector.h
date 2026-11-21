@@ -161,8 +161,14 @@ private:
         }
         if (best < 0) { publish (r); return; }
 
-        // Continuity: if the previous period sits at an octave of this one and
-        // is nearly as good, keep following the previous octave.
+        // Continuity: if the previous period sits at an octave of this one,
+        // keep following the previous octave when it fits as well. Going down
+        // to a shorter period (the octave above) needs it nearly as good; going
+        // back up to the longer one (the octave below) needs it clearly better,
+        // because any periodic sound fits twice its period too: in 1.x that kept
+        // a real octave leap upwards stuck on the old octave (v2 fix). A voice
+        // with a weak fundamental still holds its octave: there the shorter
+        // period fits far worse than the true one.
         if (prevTau > 0.0f && last.voiced)
         {
             for (float ratio : { 2.0f, 0.5f })
@@ -176,7 +182,8 @@ private:
                     const int c = std::clamp (alt + k, tMin, tMax);
                     if (cmnd[(size_t) c] < cmnd[(size_t) a]) a = c;
                 }
-                if (cmnd[(size_t) a] < cmnd[(size_t) best] + 0.08f) best = a;
+                const float margin = ratio > 1.0f ? -0.03f : 0.08f;
+                if (cmnd[(size_t) a] < cmnd[(size_t) best] + margin) best = a;
             }
         }
 

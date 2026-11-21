@@ -3,6 +3,7 @@
 //   TUNE    - key, scale, the correction controls, scale notes and micro-tuning
 //   VOICE   - character, throat, grit, breath, transpose and the added vibrato
 //   HARMONY - three harmony voices, the double and their ensemble
+//   BEAT    - Chord Lock (the chord heard on the sidechain) and Motion (v2)
 //   MOD     - LFO 1, LFO 2, Envelope, Drift and the 16-slot matrix
 //   GLOBAL  - levels, latency, tempo, seed, about
 
@@ -251,6 +252,306 @@ private:
     Panel h1, h2, h3, dbl, ensemble;
 };
 
+
+// ---------------------------------------------------------------------------
+// BEAT page (v2).
+
+// Sets one parameter from the UI as a host-visible gesture.
+inline void setParamFromUi (LodestoneProcessor& p, P param, float real)
+{
+    if (auto* prm = p.apvts.getParameter (def (param).id))
+    {
+        const float n = prm->convertTo0to1 (real);
+        if (std::abs (prm->getValue() - n) < 1.0e-7f) return;
+        prm->beginChangeGesture();
+        prm->setValueNotifyingHost (n);
+        prm->endChangeGesture();
+    }
+}
+
+// What the beat is playing: the chord name, whether the sidechain is
+// connected and has sound, and the beat's notes as 12 bars (chord tones lit).
+class ChordView : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    explicit ChordView (LodestoneProcessor& p) : proc (p)
+    {
+        setTooltip ("The chord the beat is playing, heard on Lodestone's sidechain input. Bars: how much of each note the beat "
+                    "plays; lit bars are the chord's notes.");
+    }
+
+    void tick()
+    {
+        const int root = proc.uiChordRoot.load(), shape = proc.uiChordShape.load();
+        const bool hearing = proc.uiBeatHearing.load(), connected = proc.uiSidechainConnected.load();
+        bool changed = root != lastRoot || shape != lastShape || hearing != lastHearing || connected != lastConnected;
+        for (int i = 0; i < 12; ++i)
+        {
+            const float v = proc.uiBeatChroma[(size_t) i].load();
+            if (std::abs (v - bars[(size_t) i]) > 0.004f) { bars[(size_t) i] = v; changed = true; }
+        }
+        lastRoot = root; lastShape = shape; lastHearing = hearing; lastConnected = connected;
+        if (changed) repaint();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        auto r = getLocalBounds().toFloat();
+        g.setColour (theme::screen);
+        g.fillRoundedRectangle (r, 8.0f);
+        g.setColour (theme::edge);
+        g.drawRoundedRectangle (r.reduced (0.5f), 8.0f, 1.0f);
+        r = r.reduced (14.0f, 10.0f);
+
+        dsp::Chord c;
+        c.root = lastRoot;
+        c.shape = juce::jlimit (0, dsp::kNumChordShapes - 1, lastShape);
+        char name[16];
+        dsp::chordName (c, name, 16);
+        theme::legend (g, "Chord", r.removeFromTop (14.0f), theme::textFaint, 9.5f, juce::Justification::centredLeft);
+        g.setColour (c.valid() ? theme::beat : theme::textFaint);
+        g.setFont (theme::font (40.0f, true));
+        g.drawText (c.valid() ? juce::String (name) : juce::String ("--"), r.removeFromTop (46.0f), juce::Justification::centredLeft, false);
+
+        const juce::String status = ! lastConnected ? "No sidechain: route the beat to Lodestone's sidechain input"
+                                  : ! lastHearing   ? "Sidechain connected: waiting for the beat"
+                                                    : "Hearing the beat";
+        g.setColour (lastConnected && lastHearing ? theme::beat : theme::textDim);
+        g.setFont (theme::font (13.0f));
+        g.drawFittedText (status, r.removeFromTop (34.0f).toNearestInt(), juce::Justification::centredLeft, 2);
+        r.removeFromTop (6.0f);
+
+        // Chroma bars.
+        const auto mask = c.mask();
+        float mx = 0.02f;
+        for (float v : bars) mx = juce::jmax (mx, v);
+        auto labels = r.removeFromBottom (16.0f);
+        const float w = r.getWidth() / 12.0f;
+        for (int i = 0; i < 12; ++i)
+        {
+            auto col = juce::Rectangle<float> (r.getX() + w * (float) i, r.getY(), w, r.getHeight()).reduced (3.0f, 0.0f);
+            g.setColour (theme::well);
+            g.fillRoundedRectangle (col, 3.0f);
+            const bool tone = dsp::has (mask, i);
+            const float h = col.getHeight() * juce::jlimit (0.0f, 1.0f, bars[(size_t) i] / mx);
+            g.setColour (tone ? theme::beat : theme::textFaint.withAlpha (0.6f));
+            g.fillRoundedRectangle (col.removeFromBottom (h), 3.0f);
+            g.setColour (tone ? theme::beat : theme::textDim);
+            g.setFont (theme::font (11.0f, tone));
+            g.drawText (dsp::noteName (i), labels.withX (r.getX() + w * (float) i).withWidth (w), juce::Justification::centred, false);
+        }
+    }
+
+private:
+    LodestoneProcessor& proc;
+    std::array<float, 12> bars {};
+    int lastRoot = -2, lastShape = 0;
+    bool lastHearing = false, lastConnected = false;
+};
+
+// The Motion pattern: 16 steps, each a number of notes up or down the scale.
+// Drag to draw (across steps), double-click a step for 0; the step playing
+// lights up, steps past the pattern length are dimmed.
+class MotionGrid : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    static constexpr int kRange = 12;
+
+    explicit MotionGrid (LodestoneProcessor& p) : proc (p)
+    {
+        setMouseCursor (juce::MouseCursor::PointingHandCursor);
+        setTooltip ("The Motion pattern: drag up or down to set how many notes each step moves (draw across steps). "
+                    "Double-click a step for 0. Steps past the Steps setting are skipped.");
+    }
+
+    void tick()
+    {
+        int h = proc.uiMotionStep.load();
+        for (int i = 0; i < dsp::kMotionSteps; ++i)
+            h = h * 31 + (int) proc.apvts.getRawParameterValue (def (motionStepParam (i)).id)->load();
+        h = h * 31 + (int) proc.apvts.getRawParameterValue (def (P::motionLength).id)->load();
+        h = h * 31 + (proc.apvts.getRawParameterValue (def (P::motionOn).id)->load() > 0.5f ? 1 : 0);
+        if (h != lastHash) { lastHash = h; repaint(); }
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        auto r = getLocalBounds().toFloat();
+        g.setColour (theme::screen);
+        g.fillRoundedRectangle (r, 8.0f);
+        g.setColour (theme::edge);
+        g.drawRoundedRectangle (r.reduced (0.5f), 8.0f, 1.0f);
+
+        const auto accent = theme::stage (Stage::motion);
+        const bool on = value (P::motionOn) > 0.5f;
+        const int len = juce::roundToInt (value (P::motionLength));
+        const int playing = proc.uiMotionStep.load();
+        auto area = cells();
+        const float zeroY = yFor (0);
+        g.setColour (juce::Colours::white.withAlpha (0.12f));
+        g.drawHorizontalLine ((int) zeroY, area.getX(), area.getRight());
+
+        for (int i = 0; i < dsp::kMotionSteps; ++i)
+        {
+            auto col = column (i);
+            const int v = juce::roundToInt (value (motionStepParam (i)));
+            const bool used = i < len;
+            const bool now = on && i == playing;
+            g.setColour (theme::well.withAlpha (used ? 1.0f : 0.5f));
+            g.fillRoundedRectangle (col.reduced (2.0f, 0.0f), 4.0f);
+            if (now)
+            {
+                g.setColour (accent.withAlpha (0.16f));
+                g.fillRoundedRectangle (col.reduced (2.0f, 0.0f), 4.0f);
+            }
+            const float y = yFor (v);
+            auto bar = juce::Rectangle<float> (col.getX() + 5.0f, juce::jmin (y, zeroY), col.getWidth() - 10.0f, juce::jmax (3.0f, std::abs (zeroY - y)));
+            if (v == 0) bar = bar.withHeight (3.0f).withCentre ({ bar.getCentreX(), zeroY });
+            g.setColour ((used ? accent : theme::textFaint).withAlpha (used ? (on ? 1.0f : 0.55f) : 0.35f));
+            g.fillRoundedRectangle (bar, 2.5f);
+
+            g.setColour (used ? (now ? accent : theme::textDim) : theme::textFaint);
+            g.setFont (theme::font (11.5f, now));
+            g.drawText ((v > 0 ? "+" : "") + juce::String (v), col.withY (area.getBottom() + 2.0f).withHeight (16.0f), juce::Justification::centred, false);
+            g.setColour (theme::textFaint);
+            g.setFont (theme::font (10.0f));
+            g.drawText (juce::String (i + 1), col.withY (r.getY() + 3.0f).withHeight (14.0f), juce::Justification::centred, false);
+        }
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        proc.undo.beginNewTransaction ("Motion step");
+        lastCol = -1;
+        paintAt (e.position);
+    }
+    void mouseDrag (const juce::MouseEvent& e) override { paintAt (e.position); }
+    void mouseDoubleClick (const juce::MouseEvent& e) override
+    {
+        const int i = columnAt (e.position.x);
+        if (i < 0) return;
+        proc.undo.beginNewTransaction ("Motion step");
+        setParamFromUi (proc, motionStepParam (i), 0.0f);
+    }
+
+private:
+    float value (P p) const { return proc.apvts.getRawParameterValue (def (p).id)->load(); }
+    juce::Rectangle<float> cells() const { return getLocalBounds().toFloat().reduced (8.0f, 0.0f).withTrimmedTop (20.0f).withTrimmedBottom (22.0f); }
+    juce::Rectangle<float> column (int i) const
+    {
+        const auto a = cells();
+        const float w = a.getWidth() / (float) dsp::kMotionSteps;
+        return { a.getX() + w * (float) i, a.getY(), w, a.getHeight() };
+    }
+    float yFor (int v) const
+    {
+        const auto a = cells().reduced (0.0f, 4.0f);
+        return a.getCentreY() - (float) v / (float) kRange * a.getHeight() * 0.5f;
+    }
+    int columnAt (float x) const
+    {
+        const auto a = cells();
+        if (x < a.getX() || x >= a.getRight()) return -1;
+        return juce::jlimit (0, dsp::kMotionSteps - 1, (int) ((x - a.getX()) / (a.getWidth() / (float) dsp::kMotionSteps)));
+    }
+    void paintAt (juce::Point<float> pos)
+    {
+        const int i = columnAt (juce::jlimit (cells().getX(), cells().getRight() - 1.0f, pos.x));
+        if (i < 0) return;
+        const auto a = cells().reduced (0.0f, 4.0f);
+        const int v = juce::jlimit (-kRange, kRange, juce::roundToInt ((a.getCentreY() - pos.y) / (a.getHeight() * 0.5f) * (float) kRange));
+        setParamFromUi (proc, motionStepParam (i), (float) v);
+        lastCol = i;
+        repaint();
+    }
+
+    LodestoneProcessor& proc;
+    int lastHash = 0, lastCol = -1;
+};
+
+// Ready-made Motion patterns: written to the steps, Steps and Rate as one undoable edit.
+struct MotionPattern { const char* name; std::vector<int> steps; int division; };
+inline const std::vector<MotionPattern>& motionPatterns()
+{
+    static const std::vector<MotionPattern> p = {
+        { "Up and Down",  { 0, 2, 4, 2, 0, 2, 4, 7 }, dsp::Div::d8 },
+        { "Trill",        { 0, 1 },                   dsp::Div::d16 },
+        { "Rising Arp",   { 0, 2, 4, 7 },             dsp::Div::d16 },
+        { "Falling Arp",  { 7, 4, 2, 0 },             dsp::Div::d16 },
+        { "Octave Hop",   { 0, 7 },                   dsp::Div::d8 },
+        { "Turn",         { 0, 1, 0, -1 },            dsp::Div::d16 },
+        { "Fifth Stab",   { 0, 0, 4, 0 },             dsp::Div::d8 },
+        { "Staircase",    { 0, 1, 2, 3, 4, 5, 6, 7 }, dsp::Div::d16 },
+        { "Low Answer",   { 0, 0, 0, -3, 0, 0, -5, -7 }, dsp::Div::d8 },
+        { "Triplet Roll", { 0, 2, 4 },                dsp::Div::d8T },
+    };
+    return p;
+}
+
+inline void applyMotionPattern (LodestoneProcessor& proc, const MotionPattern& m)
+{
+    proc.undo.beginNewTransaction ("Motion pattern");
+    for (int i = 0; i < dsp::kMotionSteps; ++i)
+        setParamFromUi (proc, motionStepParam (i), i < (int) m.steps.size() ? (float) m.steps[(size_t) i] : 0.0f);
+    setParamFromUi (proc, P::motionLength, (float) m.steps.size());
+    setParamFromUi (proc, P::motionRate, (float) m.division);
+}
+
+class BeatPage : public juce::Component
+{
+public:
+    explicit BeatPage (LodestoneProcessor& p)
+        : proc (p), store (p), chordView (p), grid (p),
+          chord ("Chord Lock: Follow the Beat", theme::beat),
+          motion ("Motion", theme::stage (Stage::motion), store.led (P::motionOn, theme::stage (Stage::motion), true, "Motion"))
+    {
+        const auto m = theme::stage (Stage::motion);
+        chord.addRow ({ &chordView }, 1.5f);
+        chord.addRow ({ store.knob (P::chordLock, theme::beat, "Chord Lock", Knob::Size::large) }, 1.0f);
+        addAndMakeVisible (chord);
+
+        patterns.setTooltip ("Ready-made patterns: trills, arps, octave hops");
+        patterns.setMouseCursor (juce::MouseCursor::PointingHandCursor);
+        patterns.onClick = [this]
+        {
+            juce::PopupMenu menu;
+            const auto& list = motionPatterns();
+            for (int i = 0; i < (int) list.size(); ++i) menu.addItem (i + 1, list[(size_t) i].name);
+            menu.addSeparator();
+            menu.addItem (1000, "Clear (all steps 0)");
+            menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (patterns), [this] (int r)
+            {
+                if (r == 1000) applyMotionPattern (proc, { "Clear", { 0, 0, 0, 0, 0, 0, 0, 0 }, dsp::Div::d8 });
+                else if (r > 0) applyMotionPattern (proc, motionPatterns()[(size_t) (r - 1)]);
+            });
+        };
+        motion.addRow ({ store.choice (P::motionRate, m), store.knob (P::motionLength, m), store.knob (P::motionGlide, m),
+                         store.segment (P::motionStart, { "GRID", "PHRASE" }, m), &patterns }, 0.75f);
+        motion.addRow ({ &grid }, 1.25f);
+        addAndMakeVisible (motion);
+    }
+
+    void tick() { store.tick(); chordView.tick(); grid.tick(); }
+
+    void resized() override
+    {
+        auto r = getLocalBounds();
+        chord.setBounds (r.removeFromLeft (r.getWidth() * 34 / 100));
+        r.removeFromLeft (10);
+        motion.setBounds (r);
+        // The pattern button sits in a knob-sized cell: keep it button-sized.
+        patterns.setBounds (patterns.getBounds().withSizeKeepingCentre (juce::jmin (patterns.getWidth(), 110), 30));
+    }
+
+private:
+    LodestoneProcessor& proc;
+    ControlStore store;
+    ChordView chordView;
+    MotionGrid grid;
+    juce::TextButton patterns { "PATTERNS" };
+    Panel chord, motion;
+};
+
 // ---------------------------------------------------------------------------
 // Live meter for a modulation source (bipolar or 0..1).
 class SourceMeter : public juce::Component
@@ -371,6 +672,7 @@ private:
         addGroup ("Vibrato", idx (P::vbOn), idx (P::vbVar));
         addGroup ("Harmonies", idx (P::h1On), idx (P::harmHumanize));
         addGroup ("Double", idx (P::dbOn), idx (P::dbDelay));
+        addGroup ("Beat", idx (P::chordLock), idx (P::mStep16));
         addGroup ("Modulators", idx (P::lfo1Shape), idx (P::driftSmooth));
         m.addSeparator();
         m.addItem (100000, "None");
